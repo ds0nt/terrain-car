@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Only build-time deps needed here — compiling Bevy doesn't need a GPU
+      # or a display, just the dev headers winit/rodio/etc. link against.
+      # Covers both the X11 and Wayland windowing backends so the binary
+      # works on either.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            g++ pkg-config libx11-dev libasound2-dev libudev-dev \
+            libxkbcommon-x11-0 libwayland-dev libxkbcommon-dev
+
+      - name: Build client
+        run: cargo build -p client --release
+
+      - name: Build server
+        run: cargo build -p server --release
+
+      - name: Strip binaries
+        run: |
+          strip target/release/terrain_car
+          strip target/release/terrain_car_server
+
+      - name: Package client
+        run: |
+          mkdir -p pkg/terrain-car-client-linux-x64
+          cp target/release/terrain_car pkg/terrain-car-client-linux-x64/
+          cp README.md pkg/terrain-car-client-linux-x64/
+          tar -cJf terrain-car-client-linux-x64.tar.xz -C pkg terrain-car-client-linux-x64
+
+      - name: Package server
+        run: |
+          mkdir -p pkg/terrain-car-server-linux-x64
+          cp target/release/terrain_car_server pkg/terrain-car-server-linux-x64/
+          cp README.md pkg/terrain-car-server-linux-x64/
+          tar -cJf terrain-car-server-linux-x64.tar.xz -C pkg terrain-car-server-linux-x64
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64-binaries
+          path: |
+            terrain-car-client-linux-x64.tar.xz
+            terrain-car-server-linux-x64.tar.xz
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            terrain-car-client-linux-x64.tar.xz
+            terrain-car-server-linux-x64.tar.xz
+          generate_release_notes: true
