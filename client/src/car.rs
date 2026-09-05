@@ -4,6 +4,7 @@ use bevy_rapier3d::prelude::*;
 use bevy_replicon::prelude::ClientTriggerExt;
 pub use shared::car_physics::{CarChassis, CarInput};
 use shared::car_physics::{compute_wheel_forces, Wheel, WheelStepInput};
+use shared::combat::{Health, DEFAULT_MAX_HEALTH};
 pub use shared::protocol::LocalCar;
 use shared::terrain_gen::{find_flat_spawn, height_at, TerrainNoise};
 
@@ -111,6 +112,12 @@ fn spawn_car(
         },
         Ccd::enabled(),
         chassis,
+        // Matches the server's own spawn value (see CarChassis::color_seed's
+        // docs for why the same "predict a matching guess so there's no
+        // visible pop once the authoritative echo merges in" reasoning
+        // applies here too) — every car starts at full health, so this
+        // guess is always right at connect time.
+        Health::full(DEFAULT_MAX_HEALTH),
         TerrainTracker,
         LocalCar(client_id.0),
     ));

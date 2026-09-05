@@ -3,6 +3,7 @@ use bevy_replicon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::car_physics::CarChassis;
+use crate::combat::Health;
 
 /// Client-only marker: the client inserts this on the car entity it spawns
 /// immediately on connecting, before the server's authoritative car for
@@ -158,6 +159,10 @@ pub struct LightningStrikeMsg {
 pub fn register_protocol(app: &mut App) {
     app.replicate_once::<CarChassis>()
         .replicate::<CarSnapshot>()
+        // Unlike CarChassis's one-shot tuning data, health changes
+        // constantly once guns exist — every client needs to see it live,
+        // not just once at spawn.
+        .replicate::<Health>()
         .add_client_event::<CarInputMsg>(Channel::Unreliable)
         .add_client_event::<CarResetMsg>(Channel::Ordered)
         .add_client_event::<RegenRequestMsg>(Channel::Ordered)

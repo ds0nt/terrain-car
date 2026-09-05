@@ -44,10 +44,16 @@ pub struct TerrainDetailExtension {
 impl Default for TerrainDetailExtension {
     fn default() -> Self {
         Self {
-            macro_freq: 0.05,
-            micro_freq: 0.6,
-            color_detail_strength: 0.12,
-            normal_strength: 0.5,
+            // Mars regolith: bigger dust-drift/crater-field patches than
+            // the old fine-grass grain (lower macro_freq), a tighter pebbly
+            // grain up close (higher micro_freq), more visible dust/rock
+            // tonal contrast (higher color_detail_strength), and a
+            // stronger fake bump so the same noise reads as pitted,
+            // cratered ground catching light rather than smooth turf.
+            macro_freq: 0.035,
+            micro_freq: 0.9,
+            color_detail_strength: 0.22,
+            normal_strength: 0.85,
         }
     }
 }

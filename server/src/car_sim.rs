@@ -9,6 +9,7 @@ use shared::car_physics::{
     compute_wheel_forces, default_chassis, wheel_mounts, CarChassis, CarInput, CarInputState,
     WheelStepInput, CAR_ANGULAR_DAMPING, CAR_LINEAR_DAMPING, CAR_MASS,
 };
+use shared::combat::{Health, DEFAULT_MAX_HEALTH};
 use shared::protocol::{
     spawn_car_signature, CarInputMsg, CarResetMsg, CarSnapshot, RegenRequestMsg,
     WorldRegenMsg,
@@ -214,6 +215,7 @@ fn spawn_car_on_connect(
         chassis,
         CarInputState::default(),
         CarSnapshot::default(),
+        Health::full(DEFAULT_MAX_HEALTH),
         OwnedBy(client_entity),
         Replicated,
         // `LocalCar(network_id)` matches what the client embedded in its

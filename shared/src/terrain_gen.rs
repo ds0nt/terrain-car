@@ -322,26 +322,31 @@ fn biome_lerp_f32(corners: [f32; 4], temperature: f32, moisture: f32) -> f32 {
 }
 
 /// Blends a paint color from climate + height + slope, the same way a lot
-/// of hand-authored planet/terrain shaders do it, so we get whole climate
-/// regions (tundra, taiga, desert, grassland) with grass/dirt/rock/snow
-/// variation inside each — without needing a single external texture asset.
+/// of hand-authored planet/terrain shaders do it. One planet, not a literal
+/// climate-varied Earth — every corner reads as Martian regolith/basalt;
+/// the existing temperature/moisture blend still drives *variation*
+/// between regions (darker basalt-ish ground in "cold/wet" corners,
+/// brighter sun-bleached ochre dust in "hot/dry" ones) rather than any
+/// corner reading as grass or blue-tinted snow.
 pub fn terrain_color(height: f32, slope: f32, detail: f32, temperature: f32, moisture: f32) -> Color {
     // [cold_dry, cold_wet, hot_dry, hot_wet]
     let lowland_corners = [
-        Vec3::new(0.45, 0.48, 0.42), // tundra: pale, sparse
-        Vec3::new(0.15, 0.35, 0.28), // taiga: deep mossy green
-        Vec3::new(0.76, 0.62, 0.38), // desert: sand
-        Vec3::new(0.22, 0.48, 0.16), // grassland/savanna
+        Vec3::new(0.58, 0.40, 0.30), // pale dusty rust
+        Vec3::new(0.30, 0.20, 0.16), // dark basaltic red-brown
+        Vec3::new(0.72, 0.40, 0.20), // bright ochre/orange regolith
+        Vec3::new(0.50, 0.26, 0.16), // deep rust-brown
     ];
     let rock_corners = [
-        Vec3::new(0.40, 0.42, 0.46),
-        Vec3::new(0.34, 0.36, 0.35),
-        Vec3::new(0.55, 0.35, 0.22), // canyon rust/sandstone
-        Vec3::new(0.42, 0.40, 0.36),
+        Vec3::new(0.40, 0.33, 0.29), // grey-brown basalt
+        Vec3::new(0.26, 0.23, 0.23), // dark basalt grey
+        Vec3::new(0.58, 0.30, 0.17), // rusty sandstone/canyon rock
+        Vec3::new(0.40, 0.28, 0.22), // mid rust-brown rock
     ];
     // Snow line height, as a fraction of MOUNTAIN_HEIGHT. The desert corner
-    // is set far above any possible peak so it effectively never snows.
-    let snow_line_corners = [0.22, 0.32, 10.0, 0.62];
+    // is set far above any possible peak so it effectively never caps —
+    // pushed a little higher than an Earth snow line overall (polar
+    // CO2/water-ice caps are rarer/harder to reach than Earth snowfall).
+    let snow_line_corners = [0.28, 0.36, 10.0, 0.68];
 
     let lowland_base = biome_lerp(lowland_corners, temperature, moisture);
     let rock_base = biome_lerp(rock_corners, temperature, moisture);
@@ -360,8 +365,10 @@ pub fn terrain_color(height: f32, slope: f32, detail: f32, temperature: f32, moi
     let slope_t = ((slope - 0.5) / 0.35).clamp(0.0, 1.0);
     let with_rock = lowland.lerp(rock_base, slope_t);
 
-    // Snow caps above the biome's snow line, softened at the boundary.
-    let snow = Vec3::new(0.92, 0.93, 0.95);
+    // Caps above the biome's snow line, softened at the boundary — a dusty
+    // pale frost rather than bright blue-white Earth snow, closer to
+    // dust-coated CO2/water ice.
+    let snow = Vec3::new(0.82, 0.78, 0.72);
     let snow_t =
         ((height - MOUNTAIN_HEIGHT * snow_line) / (MOUNTAIN_HEIGHT * 0.15)).clamp(0.0, 1.0);
     let final_color = with_rock.lerp(snow, snow_t);

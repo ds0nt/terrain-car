@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::Velocity;
 
+use shared::combat::Health;
 use shared::terrain_gen::{biome_label, TerrainNoise};
 
 use crate::car::LocalCar;
@@ -22,6 +23,8 @@ struct SpeedText;
 struct AltitudeText;
 #[derive(Component)]
 struct GForceText;
+#[derive(Component)]
+struct HealthText;
 #[derive(Component)]
 struct WorldTypeText;
 #[derive(Component)]
@@ -62,6 +65,7 @@ fn spawn_hud(mut commands: Commands) {
             parent.spawn((Text::new("SPD    0 km/h"), font.clone(), color, SpeedText));
             parent.spawn((Text::new("ALT    0 m"), font.clone(), color, AltitudeText));
             parent.spawn((Text::new("G      1.00"), font.clone(), color, GForceText));
+            parent.spawn((Text::new("HEALTH 100%"), font.clone(), color, HealthText));
             parent.spawn((
                 Text::new(""),
                 font,
@@ -77,7 +81,7 @@ fn update_hud(
     noise: Res<TerrainNoise>,
     origin: Res<WorldOrigin>,
     recording: Res<RecordingActive>,
-    chassis_q: Query<(&GlobalTransform, &Velocity), With<LocalCar>>,
+    chassis_q: Query<(&GlobalTransform, &Velocity, &Health), With<LocalCar>>,
     mut prev_vertical_speed: Local<f32>,
     mut world_q: Query<
         &mut Text,
@@ -86,24 +90,53 @@ fn update_hud(
             Without<SpeedText>,
             Without<AltitudeText>,
             Without<GForceText>,
+            Without<HealthText>,
             Without<RecText>,
         ),
     >,
     mut speed_q: Query<
         &mut Text,
-        (With<SpeedText>, Without<AltitudeText>, Without<GForceText>, Without<RecText>),
+        (
+            With<SpeedText>,
+            Without<AltitudeText>,
+            Without<GForceText>,
+            Without<HealthText>,
+            Without<RecText>,
+        ),
     >,
     mut alt_q: Query<
         &mut Text,
-        (With<AltitudeText>, Without<SpeedText>, Without<GForceText>, Without<RecText>),
+        (
+            With<AltitudeText>,
+            Without<SpeedText>,
+            Without<GForceText>,
+            Without<HealthText>,
+            Without<RecText>,
+        ),
     >,
     mut g_q: Query<
         &mut Text,
-        (With<GForceText>, Without<SpeedText>, Without<AltitudeText>, Without<RecText>),
+        (
+            With<GForceText>,
+            Without<SpeedText>,
+            Without<AltitudeText>,
+            Without<HealthText>,
+            Without<RecText>,
+        ),
+    >,
+    mut health_q: Query<
+        &mut Text,
+        (
+            With<HealthText>,
+            Without<SpeedText>,
+            Without<AltitudeText>,
+            Without<GForceText>,
+            Without<RecText>,
+        ),
     >,
     mut rec_q: Query<&mut Text, With<RecText>>,
 ) {
-    let Ok((chassis_gt, velocity)) = chassis_q.single() else {
+    let Ok((chassis_gt, velocity, health)) = chassis_q.single() else {
         return;
     };
     let dt = time.delta_secs();
@@ -139,6 +172,9 @@ fn update_hud(
     }
     if let Ok(mut text) = g_q.single_mut() {
         text.0 = format!("G    {g_force:>6.2}");
+    }
+    if let Ok(mut text) = health_q.single_mut() {
+        text.0 = format!("HEALTH {:>3.0}%", health.fraction() * 100.0);
     }
     if let Ok(mut text) = rec_q.single_mut() {
         text.0 = if recording.0 { "REC  ●".to_string() } else { String::new() };
