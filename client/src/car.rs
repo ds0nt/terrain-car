@@ -75,7 +75,11 @@ fn read_car_input(keyboard: Res<ButtonInput<KeyCode>>, mut input: ResMut<CarInpu
 /// prediction: it runs immediately on Startup, before any server
 /// connection necessarily exists yet, so driving never waits on the
 /// network.
-fn spawn_car(mut commands: Commands, noise: Res<TerrainNoise>) {
+fn spawn_car(
+    mut commands: Commands,
+    noise: Res<TerrainNoise>,
+    client_id: Res<crate::net::LocalClientId>,
+) {
     // WorldOrigin always starts at true (0, 0, 0), so local and true
     // coordinates coincide for this very first spawn. Terrain can be
     // genuinely extreme now, so search nearby for flat-ish ground rather
@@ -85,7 +89,13 @@ fn spawn_car(mut commands: Commands, noise: Res<TerrainNoise>) {
     let spawn_x = spawn_true.x as f32;
     let spawn_z = spawn_true.z as f32;
 
-    let chassis = shared::car_physics::default_chassis();
+    let mut chassis = shared::car_physics::default_chassis();
+    // Matches what the server will assign this same connection (see
+    // CarChassis::color_seed's docs) — just a placeholder guess until the
+    // server's authoritative chassis replicates back onto this same
+    // entity, but since both sides use the same connection id, it's
+    // already correct and there's no visible color pop.
+    chassis.color_seed = client_id.0 as u32;
     let half_extents = chassis.half_extents;
 
     commands.spawn((
@@ -102,7 +112,7 @@ fn spawn_car(mut commands: Commands, noise: Res<TerrainNoise>) {
         Ccd::enabled(),
         chassis,
         TerrainTracker,
-        LocalCar,
+        LocalCar(client_id.0),
     ));
 }
 

@@ -19,7 +19,8 @@ use shared::protocol::register_protocol;
 fn main() {
     let mut app = App::new();
 
-    app.insert_resource(ClearColor(Color::srgb(0.55, 0.75, 0.95)))
+    app.init_resource::<net::LocalClientId>()
+        .insert_resource(ClearColor(Color::srgb(0.55, 0.75, 0.95)))
         // `TimestepMode` is a standalone global resource (not a field of
         // `RapierConfiguration`), and `RapierPhysicsPlugin::build()` only
         // `init_resource`s it (won't overwrite an existing value) — so

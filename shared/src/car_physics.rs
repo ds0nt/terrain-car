@@ -25,6 +25,14 @@ pub struct CarChassis {
     pub engine_force: f32,
     pub brake_force: f32,
     pub traction: f32,
+    /// Drives this car's paint color (see car_render.rs's `color_from_seed`)
+    /// — set by whoever spawns the car to that player's own connection id
+    /// (truncated), so it's already known and identical to both the server
+    /// and that player's own client before the server's authoritative
+    /// chassis even replicates back (no visible color pop on merge), and
+    /// every other client sees the same color too since `CarChassis`
+    /// itself is replicated.
+    pub color_seed: u32,
 }
 
 #[derive(Component)]
@@ -96,6 +104,10 @@ pub fn default_chassis() -> CarChassis {
         engine_force: 22_000.0,
         brake_force: 20_000.0,
         traction: 12_000.0,
+        // Caller sets this to the actual player's connection id — this
+        // placeholder only matters if something spawns a car without ever
+        // overwriting it.
+        color_seed: 0,
     }
 }
 
@@ -213,6 +225,7 @@ mod tests {
             engine_force: 22_000.0,
             brake_force: 20_000.0,
             traction: 12_000.0,
+            color_seed: 0,
         }
     }
 

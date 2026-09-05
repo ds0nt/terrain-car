@@ -21,7 +21,32 @@ impl Plugin for ClientNetPlugin {
     }
 }
 
-fn connect_to_server(mut commands: Commands, channels: Res<RepliconChannels>) {
+/// This client's own renet connection id, generated once up front (see
+/// `main.rs`, inserted before any Startup system runs) rather than as a
+/// local variable inside `connect_to_server` — car.rs's `spawn_car` also
+/// needs this exact value to embed in `LocalCar` (see protocol.rs's docs on
+/// why that component needs a real per-client value), and Startup systems
+/// across different plugins have no guaranteed relative order, so both
+/// sides reading one pre-computed resource is simpler than trying to order
+/// two Startup systems against each other.
+#[derive(Resource, Clone, Copy)]
+pub struct LocalClientId(pub u64);
+
+impl Default for LocalClientId {
+    fn default() -> Self {
+        let millis = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock is set before the Unix epoch")
+            .as_millis();
+        Self(millis as u64)
+    }
+}
+
+fn connect_to_server(
+    mut commands: Commands,
+    channels: Res<RepliconChannels>,
+    client_id: Res<LocalClientId>,
+) {
     // `TERRAIN_CAR_SERVER=host:port cargo run` to connect elsewhere;
     // defaults to loopback for local testing (server + one client on the
     // same machine). Resolved via `ToSocketAddrs` (does a real DNS lookup)
@@ -61,14 +86,14 @@ fn connect_to_server(mut commands: Commands, channels: Res<RepliconChannels>) {
     let current_time = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("system clock is set before the Unix epoch");
-    // Time-based id: fine for "trusted friends over a known address," not
-    // a real identity system — see the plan's risk callouts on
-    // ServerAuthentication::Unsecure.
-    let client_id = current_time.as_millis() as u64;
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .expect("failed to bind a local UDP socket for the client");
+    // Time-based id: fine for "trusted friends over a known address," not
+    // a real identity system — see the plan's risk callouts on
+    // ServerAuthentication::Unsecure. Shared with car.rs's spawn_car via
+    // the `LocalClientId` resource — see its docs.
     let authentication = ClientAuthentication::Unsecure {
-        client_id,
+        client_id: client_id.0,
         protocol_id: PROTOCOL_ID,
         server_addr,
         user_data: None,

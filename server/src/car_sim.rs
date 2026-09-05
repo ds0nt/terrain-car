@@ -4,12 +4,13 @@ use bevy::math::DVec3;
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 use bevy_replicon::prelude::*;
+use bevy_replicon::shared::backend::connected_client::NetworkId;
 use shared::car_physics::{
     compute_wheel_forces, default_chassis, wheel_mounts, CarChassis, CarInput, CarInputState,
     WheelStepInput, CAR_ANGULAR_DAMPING, CAR_LINEAR_DAMPING, CAR_MASS,
 };
 use shared::protocol::{
-    spawn_car_signature, CarInputMsg, CarResetMsg, CarSnapshot, LocalCar, RegenRequestMsg,
+    spawn_car_signature, CarInputMsg, CarResetMsg, CarSnapshot, RegenRequestMsg,
     WorldRegenMsg,
 };
 use shared::terrain_gen::{find_flat_spawn, height_at, random_seed, TerrainNoise};
@@ -177,9 +178,20 @@ fn spawn_car_on_connect(
     mut registry: ResMut<PlayerRegistry>,
     mut anchor: ResMut<SpawnAnchor>,
     world_state: Res<CurrentWorldState>,
+    network_ids: Query<&NetworkId>,
 ) {
     let client_entity = add.entity;
-    let chassis = default_chassis();
+    let mut chassis = default_chassis();
+    // Spawned in the same bundle as `ConnectedClient` by the renet backend
+    // (see bevy_replicon_renet's server.rs), so it's already present here.
+    let network_id = network_ids
+        .get(client_entity)
+        .unwrap_or_else(|_| panic!("client `{client_entity}` has no NetworkId"))
+        .get();
+    // Also this player's car color (see CarChassis::color_seed's docs) —
+    // reusing the connection id means the client's own local guess for its
+    // predicted car already matches what the server assigns, no pop.
+    chassis.color_seed = network_id as u32;
 
     let index = registry.assign(client_entity);
     let spawn_true = pick_spawn_point(index, &mut anchor, &noise, &origin);
@@ -203,15 +215,13 @@ fn spawn_car_on_connect(
         CarSnapshot::default(),
         OwnedBy(client_entity),
         Replicated,
-        // `Signature::of::<LocalCar>()` (inside spawn_car_signature) reads
-        // `LocalCar` *from this same entity* to compute its hash — it needs
-        // to actually be present here, not just named as a type parameter.
-        // Never replicated (not `.replicate::<LocalCar>()`'d in
-        // protocol.rs), so this never leaks to other clients; it only
-        // drives the local hash-matching that merges this entity into the
-        // connecting client's own pre-spawned one.
-        LocalCar,
-        spawn_car_signature(client_entity),
+        // `LocalCar(network_id)` matches what the client embedded in its
+        // own pre-spawned entity (see protocol.rs's docs on why this needs
+        // a real per-client value now, not a bare marker) — never
+        // replicated (not `.replicate::<LocalCar>()`'d), so this never
+        // leaks to other clients; it only drives the local hash-matching
+        // that merges this entity into the connecting client's own.
+        spawn_car_signature(client_entity, network_id),
     ));
 
     // Catch-up: if the world was already regenerated before this client

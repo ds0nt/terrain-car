@@ -14,21 +14,40 @@ use crate::car_physics::CarChassis;
 /// built-in mechanism for exactly this: when the server later spawns the
 /// authoritative car for this client with a matching signature (see
 /// `spawn_car_signature` below), replicon merges it into this same client
-/// entity instead of spawning a visible duplicate "ghost" car. This mirrors
-/// the `ClientPlayer`/`Signature::of::<ClientPlayer>()` pattern from
-/// bevy_replicon's own tic_tac_toe example, and the "predicting a
-/// projectile on the client" pattern documented directly on `Signature`.
+/// entity instead of spawning a visible duplicate "ghost" car.
+///
+/// Carries the client's own renet connection id (see
+/// `bevy_replicon_renet`'s `NetworkId`, which the server can read straight
+/// off the `ConnectedClient` entity — same value the client generated for
+/// itself before ever connecting, so both sides embed it identically with
+/// no extra round trip). This field is *not* cosmetic: `Signature`'s hash
+/// covers a component's full `Hash` impl, and this component was originally
+/// a bare marker with no fields at all — meaning every player's car hashed
+/// to the exact same value. `bevy_replicon`'s internal signature registry
+/// is a single global `hash -> entity` map with no per-client scoping of
+/// its own (it relies on callers giving it an actually-unique hash), so
+/// every second-and-later connection's registration silently collided with
+/// the first and was dropped — the likely cause of two players' cars
+/// getting confused with each other. Embedding a real per-client value
+/// fixes the collision at the root, the same way bevy_replicon's own
+/// "predicting a projectile" example gives its signature uniqueness via a
+/// real field rather than relying on `for_client` scoping alone.
 #[derive(Component, Hash, Clone, Copy)]
 #[require(Signature::of::<LocalCar>())]
-pub struct LocalCar;
+pub struct LocalCar(pub u64);
 
 /// Server-side helper: the signature a newly-connected client's own
 /// authoritative car must carry so it merges into that client's
 /// already-locally-spawned `LocalCar` entity instead of duplicating it.
-/// `LocalCar` has no fields (every client hashes identically), so
-/// `for_client` alone is what scopes the match to the right connection.
-pub fn spawn_car_signature(client_entity: Entity) -> Signature {
-    Signature::of::<LocalCar>().for_client(client_entity)
+/// `network_id` must be that client's own renet connection id (its
+/// `NetworkId` component) so the hash matches what the client computed for
+/// itself — see `LocalCar`'s docs for why this can no longer be a bare
+/// marker.
+pub fn spawn_car_signature(client_entity: Entity, network_id: u64) -> (LocalCar, Signature) {
+    (
+        LocalCar(network_id),
+        Signature::of::<LocalCar>().for_client(client_entity),
+    )
 }
 
 /// Sent client -> server every `FixedUpdate` tick with the local player's

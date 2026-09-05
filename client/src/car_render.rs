@@ -43,7 +43,7 @@ fn init_car_visuals(
     commands.entity(insert.entity).insert((
         Mesh3d(meshes.add(Cuboid::from_size(half_extents * 2.0))),
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.8, 0.15, 0.15),
+            base_color: color_from_seed(chassis.color_seed),
             ..default()
         })),
     ));
@@ -96,6 +96,17 @@ fn init_car_visuals(
                 .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
         ));
     });
+}
+
+/// Deterministic seed -> vibrant paint color. Every car with the same
+/// `color_seed` (i.e. the same connection id — see `CarChassis::color_seed`'s
+/// docs) gets the same color on every viewer, since `CarChassis` itself is
+/// replicated. Fixed saturation/lightness, varying only hue, so every color
+/// reads clearly as "a car" against the terrain regardless of which hue it
+/// lands on.
+fn color_from_seed(seed: u32) -> Color {
+    let hue = (seed.wrapping_mul(2_654_435_761) % 360) as f32;
+    Color::hsl(hue, 0.75, 0.5)
 }
 
 /// Remote (non-local) cars have no Rapier body client-side at all — just
