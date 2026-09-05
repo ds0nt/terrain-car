@@ -18,6 +18,7 @@ use shared::terrain_gen::{find_flat_spawn, height_at, random_seed, TerrainNoise}
 use shared::worldspace::WorldOrigin;
 
 use crate::terrain_phys::{regenerate_terrain_colliders, ServerTerrainEntity};
+use crate::weapons::LastFired;
 
 /// Search radius for the very *first* car to ever spawn — needs room to
 /// actually find flat ground since there's no existing player to anchor
@@ -215,16 +216,20 @@ fn spawn_car_on_connect(
         chassis,
         CarInputState::default(),
         CarSnapshot::default(),
-        Health::full(DEFAULT_MAX_HEALTH),
-        OwnedBy(client_entity),
-        Replicated,
-        // `LocalCar(network_id)` matches what the client embedded in its
-        // own pre-spawned entity (see protocol.rs's docs on why this needs
-        // a real per-client value now, not a bare marker) — never
-        // replicated (not `.replicate::<LocalCar>()`'d), so this never
-        // leaks to other clients; it only drives the local hash-matching
-        // that merges this entity into the connecting client's own.
-        spawn_car_signature(client_entity, network_id),
+        (
+            Health::full(DEFAULT_MAX_HEALTH),
+            LastFired::default(),
+            OwnedBy(client_entity),
+            Replicated,
+            // `LocalCar(network_id)` matches what the client embedded in
+            // its own pre-spawned entity (see protocol.rs's docs on why
+            // this needs a real per-client value now, not a bare marker)
+            // — never replicated (not `.replicate::<LocalCar>()`'d), so
+            // this never leaks to other clients; it only drives the local
+            // hash-matching that merges this entity into the connecting
+            // client's own.
+            spawn_car_signature(client_entity, network_id),
+        ),
     ));
 
     // Catch-up: if the world was already regenerated before this client

@@ -12,6 +12,7 @@ mod recorder;
 mod tectonic;
 mod terrain;
 mod terrain_material;
+mod weapon_fx;
 mod worldspace;
 
 use bevy::prelude::*;
@@ -64,6 +65,8 @@ fn main() {
             tectonic::TectonicPlugin,
             fx::FxPlugin,
             lightning_fx::LightningFxPlugin,
+            bevy_hanabi::HanabiPlugin,
+            weapon_fx::WeaponFxPlugin,
         ));
 
     // Registers replicated components/events — must use the exact same

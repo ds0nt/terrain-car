@@ -4,6 +4,7 @@ mod lightning;
 mod net;
 mod physics_fx;
 mod terrain_phys;
+mod weapons;
 
 use std::time::Duration;
 
@@ -51,6 +52,7 @@ fn main() {
         car_sim::CarSimPlugin,
         console::ConsolePlugin,
         lightning::LightningPlugin,
+        weapons::WeaponsPlugin,
     ));
 
     // Registers replicated components/events — must use the exact same

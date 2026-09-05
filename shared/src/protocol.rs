@@ -135,6 +135,37 @@ pub struct WorldRegenMsg {
     pub origin_z: f64,
 }
 
+/// Sent client -> server when the player fires the front-mounted gun.
+/// Carries nothing: the server already knows who's shooting (the sending
+/// client's own car) and reads that car's current `Transform` for the
+/// muzzle position and aim direction — same reasoning as `RegenRequestMsg`
+/// carrying no data of its own. `Unreliable`: a dropped fire request just
+/// means that shot never happened, no state to reconcile either way.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct FireGunMsg;
+
+/// Sent server -> all clients after resolving a `FireGunMsg` — the
+/// authoritative muzzle and end points (either the actual hit point, or a
+/// point at the gun's max range if nothing was hit), so every client draws
+/// the identical tracer/muzzle-flash/impact regardless of who fired or
+/// whether it connected. Deliberately carries no shooter/target `Entity`:
+/// every cosmetic effect this drives (flash, smoke, shells, tracer, impact)
+/// only needs these two points plus the direction between them, which
+/// sidesteps needing entity-id mapping across the network for a message
+/// that's otherwise purely visual. `y` is plain local-space (never
+/// affected by a `WorldOrigin` rebase, unlike x/z — see `WorldOrigin`'s
+/// docs), so only x/z need true-space f64 precision.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct GunFiredMsg {
+    pub muzzle_true_x: f64,
+    pub muzzle_y: f32,
+    pub muzzle_true_z: f64,
+    pub end_true_x: f64,
+    pub end_y: f32,
+    pub end_true_z: f64,
+    pub hit: bool,
+}
+
 /// Sent server -> all clients whenever a lightning strike lands (see
 /// server's `lightning.rs`). Carries only the strike's true-space location
 /// and blast radius — every client independently spawns the same cosmetic
@@ -166,6 +197,8 @@ pub fn register_protocol(app: &mut App) {
         .add_client_event::<CarInputMsg>(Channel::Unreliable)
         .add_client_event::<CarResetMsg>(Channel::Ordered)
         .add_client_event::<RegenRequestMsg>(Channel::Ordered)
+        .add_client_event::<FireGunMsg>(Channel::Unreliable)
+        .add_server_event::<GunFiredMsg>(Channel::Unreliable)
         .add_server_event::<WorldRegenMsg>(Channel::Ordered)
         // Unreliable: purely cosmetic, and another strike is at most 10s
         // away anyway, so a dropped one is never worth retransmitting.

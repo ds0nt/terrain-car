@@ -127,6 +127,16 @@ pub fn wheel_mounts(half_extents: Vec3) -> [(Vec3, bool); 4] {
     ]
 }
 
+/// Local (chassis-space) mount point for the front-mounted gun's muzzle —
+/// used by both the server (hitscan ray origin) and the client (gun barrel
+/// visual, muzzle-flash/tracer spawn point), so they always agree on
+/// exactly where "the front of the car" is without needing to send it over
+/// the network. Local -Z is forward (see `wheel_mounts`'s docs), so this
+/// sits ahead of the front bumper at roughly hood height.
+pub fn gun_muzzle_offset(half_extents: Vec3) -> Vec3 {
+    Vec3::new(0.0, -half_extents.y * 0.2, -(half_extents.z + 0.6))
+}
+
 /// Per-wheel inputs needed to compute one wheel's contribution to total
 /// chassis force/torque for one physics step, once a ground contact point is
 /// known. Deliberately free of ECS/Rapier types (no raycasting, no
