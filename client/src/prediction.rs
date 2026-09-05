@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use bevy::prelude::*;
-use bevy_rapier3d::prelude::Velocity;
+use bevy_rapier3d::prelude::{PhysicsSet, Velocity};
 use bevy_replicon::prelude::ClientTriggerExt;
 use shared::car_physics::CarInput;
 use shared::protocol::{CarInputMsg, CarSnapshot, LocalCar};
@@ -50,7 +50,25 @@ impl Plugin for PredictionPlugin {
         app.init_resource::<InputSequence>()
             .init_resource::<PredictionHistory>()
             .init_resource::<LocalResetGeneration>()
-            .add_systems(FixedUpdate, send_input_and_record)
+            .add_systems(FixedUpdate, send_input)
+            // Must run after Rapier has actually integrated this tick's
+            // force (PhysicsSet::Writeback, the point at which Transform
+            // reflects the result) — not just after car_suspension_and_drive,
+            // which only *sets* ExternalForce and doesn't move anything
+            // itself. Recording the position here one phase too early was a
+            // real bug: it associated "sequence N" with the position from
+            // *before* input N was applied (last tick's result), a
+            // systematic one-tick error in every reconciliation comparison.
+            // Invisible under smooth driving (positions barely change tick
+            // to tick), but blown wide open by anything abrupt — hitting an
+            // obstacle, say — where the true one-tick position delta is
+            // large enough to look like a real desync and trigger repeated,
+            // violent hard-corrections against a comparison that was wrong
+            // to begin with.
+            .add_systems(
+                FixedUpdate,
+                record_predicted_state.after(PhysicsSet::Writeback),
+            )
             .add_systems(Update, reconcile_with_server);
     }
 }
@@ -74,18 +92,15 @@ struct PredictedState {
 #[derive(Resource, Default)]
 struct PredictionHistory(VecDeque<(u32, PredictedState)>);
 
-/// Sends this tick's input to the server and records the local car's
-/// resulting predicted position under the same sequence number, for
-/// `reconcile_with_server` to later compare against the server's echo of
-/// that same sequence. Runs in `FixedUpdate` alongside
-/// `car_suspension_and_drive`, after it (see car.rs's system ordering) so
-/// the recorded position reflects this tick's simulated result.
-fn send_input_and_record(
+/// Sends this tick's input to the server, tagged with the sequence number
+/// `record_predicted_state` will use once this same tick's physics has
+/// actually been integrated. Sending itself has no ordering requirement
+/// relative to physics (`CarInput` doesn't change within a tick, so it
+/// doesn't matter when it's read) — only the *recording* half does.
+fn send_input(
     mut commands: Commands,
     input: Res<CarInput>,
     mut sequence: ResMut<InputSequence>,
-    mut history: ResMut<PredictionHistory>,
-    car_q: Query<&Transform, With<LocalCar>>,
 ) {
     let seq = sequence.0;
     sequence.0 = sequence.0.wrapping_add(1);
@@ -96,17 +111,33 @@ fn send_input_and_record(
         steer: input.steer,
         brake: input.brake,
     });
+}
 
-    if let Ok(transform) = car_q.single() {
-        history.0.push_back((
-            seq,
-            PredictedState {
-                translation: transform.translation,
-            },
-        ));
-        if history.0.len() > HISTORY_CAP {
-            history.0.pop_front();
-        }
+/// Records the local car's position *after* this tick's input has actually
+/// been integrated by Rapier (see this system's `.after(PhysicsSet::Writeback)`
+/// registration), tagged with the sequence number `send_input` just sent
+/// for it — so `reconcile_with_server` compares the server's echo of that
+/// sequence against what really happened here, not against last tick's
+/// stale position.
+fn record_predicted_state(
+    sequence: Res<InputSequence>,
+    mut history: ResMut<PredictionHistory>,
+    car_q: Query<&Transform, With<LocalCar>>,
+) {
+    let Ok(transform) = car_q.single() else {
+        return;
+    };
+    // `send_input` already advanced past the sequence this tick just
+    // applied and integrated.
+    let seq = sequence.0.wrapping_sub(1);
+    history.0.push_back((
+        seq,
+        PredictedState {
+            translation: transform.translation,
+        },
+    ));
+    if history.0.len() > HISTORY_CAP {
+        history.0.pop_front();
     }
 }
 
