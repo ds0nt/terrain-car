@@ -2,7 +2,9 @@ use bevy::math::DVec3;
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 use shared::obstacles::{obstacles_for_chunk, ObstacleKind};
-use shared::terrain_gen::{height_at, ChunkCoord, TerrainNoise, CHUNK_RESOLUTION, CHUNK_SIZE};
+use shared::terrain_gen::{
+    height_at, world_to_chunk, ChunkCoord, TerrainNoise, CHUNK_RESOLUTION, CHUNK_SIZE,
+};
 use shared::worldspace::WorldOrigin;
 
 /// Server-side terrain: physics colliders only, built from the same
@@ -60,10 +62,21 @@ pub fn regenerate_terrain_colliders(
 }
 
 fn spawn_all_terrain_colliders(commands: &mut Commands, noise: &TerrainNoise, origin: &WorldOrigin) -> u32 {
+    // Center on the chunk containing the *current* origin, not literal true
+    // chunk (0,0) — chunk coordinates are true-space grid indices (see
+    // shared::terrain_gen), so hard-coding (0,0) here meant that after any
+    // world regen (which moves `origin.offset` by up to +/-10,000 units to
+    // land somewhere new) every preloaded collider stayed exactly where it
+    // was, while newly-spawned cars appeared near the *new* origin — up to
+    // several thousand units outside any collider at all. Cars fell
+    // straight through into the void even though the client's own terrain
+    // (which does correctly follow the origin) still rendered normally,
+    // since the client was never told collision was missing.
+    let (center_x, center_z) = world_to_chunk(origin.offset);
     let mut count = 0;
     for x in -PRELOAD_RADIUS_CHUNKS..=PRELOAD_RADIUS_CHUNKS {
         for z in -PRELOAD_RADIUS_CHUNKS..=PRELOAD_RADIUS_CHUNKS {
-            spawn_chunk_collider(commands, noise, origin, (x, z));
+            spawn_chunk_collider(commands, noise, origin, (center_x + x, center_z + z));
             count += 1;
         }
     }

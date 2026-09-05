@@ -52,7 +52,8 @@ impl Plugin for CarSimPlugin {
             .add_observer(apply_car_input)
             .add_observer(apply_car_reset)
             .add_observer(apply_world_regen_request)
-            .add_systems(FixedUpdate, step_cars.before(PhysicsSet::SyncBackend));
+            .add_systems(FixedUpdate, step_cars.before(PhysicsSet::SyncBackend))
+            .add_systems(Update, recover_lost_cars);
     }
 }
 
@@ -322,6 +323,53 @@ fn apply_car_reset(
         *ext_force = ExternalForce::default();
         snapshot.reset_generation = snapshot.reset_generation.wrapping_add(1);
         break;
+    }
+}
+
+/// Below this altitude (or a non-finite position/velocity), a car is
+/// considered lost rather than legitimately airborne — real terrain never
+/// goes anywhere near this low (worst case is roughly
+/// `-(CONTINENTAL_SCALE + CANYON_DEPTH)`, a bit over -1500) — and gets
+/// recovered rather than left to fall forever. This is a hard safety net
+/// against *any* cause of "no collider under this car" (a missing-collider
+/// bug like the terrain preload not following a world regen, a one-tick
+/// gap between queuing new colliders via `Commands` and Rapier actually
+/// syncing them, or anything else we haven't thought of) rather than a fix
+/// for one specific trigger — a car that's merely fallen off a cliff will
+/// keep falling past this line too, but "briefly airborne, then reset"
+/// beats what an actual missing-collider bug did last time: an unbounded
+/// fall whose ever-more-extreme position also broke client-side
+/// reconciliation, which corrects *toward* the server's snapshot no matter
+/// how absurd it is, producing the wild altitude oscillation this was
+/// built to catch.
+const LOST_CAR_ALTITUDE_FLOOR: f32 = -5_000.0;
+
+fn recover_lost_cars(
+    noise: Res<TerrainNoise>,
+    origin: Res<WorldOrigin>,
+    mut cars: Query<(&mut Transform, &mut Velocity, &mut ExternalForce, &mut CarSnapshot)>,
+) {
+    for (mut transform, mut velocity, mut ext_force, mut snapshot) in &mut cars {
+        let lost = !transform.translation.is_finite()
+            || !velocity.linear.is_finite()
+            || transform.translation.y < LOST_CAR_ALTITUDE_FLOOR;
+        if !lost {
+            continue;
+        }
+
+        warn!(
+            "server: recovering a lost car (was at {:?})",
+            transform.translation
+        );
+        let spawn_true = find_flat_spawn(&noise, origin.offset, FIRST_SPAWN_SEARCH_RADIUS);
+        let ground_y = height_at(&noise, spawn_true.x, spawn_true.z);
+        let local_spawn = (spawn_true - origin.offset).as_vec3();
+
+        transform.translation = Vec3::new(local_spawn.x, ground_y + 2.0, local_spawn.z);
+        transform.rotation = Quat::IDENTITY;
+        *velocity = Velocity::zero();
+        *ext_force = ExternalForce::default();
+        snapshot.reset_generation = snapshot.reset_generation.wrapping_add(1);
     }
 }
 
