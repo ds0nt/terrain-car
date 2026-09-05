@@ -1,5 +1,6 @@
 mod car_sim;
 mod console;
+mod lightning;
 mod net;
 mod terrain_phys;
 
@@ -48,6 +49,7 @@ fn main() {
         terrain_phys::ServerTerrainPlugin,
         car_sim::CarSimPlugin,
         console::ConsolePlugin,
+        lightning::LightningPlugin,
     ));
 
     // Registers replicated components/events — must use the exact same

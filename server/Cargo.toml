@@ -24,3 +24,4 @@ bevy = "0.19.1"
 bevy_rapier3d = { version = "0.36.0", default-features = false, features = ["dim3"] }
 bevy_replicon = "0.44.0"
 bevy_replicon_renet = "0.20.0"
+rand = "0.8"

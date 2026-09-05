@@ -134,6 +134,22 @@ pub struct WorldRegenMsg {
     pub origin_z: f64,
 }
 
+/// Sent server -> all clients whenever a lightning strike lands (see
+/// server's `lightning.rs`). Carries only the strike's true-space location
+/// and blast radius — every client independently spawns the same cosmetic
+/// flash/shockwave effect at that position, converting to local coordinates
+/// with its own current `WorldOrigin` the same way `WorldRegenMsg` and
+/// `CarResetMsg` already do. The actual physics knockback happens only on
+/// the server (a direct `Velocity` kick to any car in range) and reaches
+/// clients through the existing `CarSnapshot` replication rather than this
+/// message — this is purely "so every screen shows the same boom."
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct LightningStrikeMsg {
+    pub true_x: f64,
+    pub true_z: f64,
+    pub radius: f32,
+}
+
 /// Registers everything that must be identical between client and server:
 /// which components replicate (and how often), and the client -> server /
 /// server -> client event channels. Both binaries call this exact function
@@ -146,6 +162,9 @@ pub fn register_protocol(app: &mut App) {
         .add_client_event::<CarResetMsg>(Channel::Ordered)
         .add_client_event::<RegenRequestMsg>(Channel::Ordered)
         .add_server_event::<WorldRegenMsg>(Channel::Ordered)
+        // Unreliable: purely cosmetic, and another strike is at most 10s
+        // away anyway, so a dropped one is never worth retransmitting.
+        .add_server_event::<LightningStrikeMsg>(Channel::Unreliable)
         // WorldRegenMsg carries no entity/component references, so it's
         // safe (and necessary) to deliver even to a client whose
         // replication handshake isn't fully established yet — this is what

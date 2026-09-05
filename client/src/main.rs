@@ -3,6 +3,7 @@ mod car;
 mod car_render;
 mod hud;
 mod lighting;
+mod lightning_fx;
 mod minimap;
 mod net;
 mod prediction;
@@ -60,6 +61,7 @@ fn main() {
             minimap::MinimapPlugin,
             recorder::RecorderPlugin,
             tectonic::TectonicPlugin,
+            lightning_fx::LightningFxPlugin,
         ));
 
     // Registers replicated components/events — must use the exact same
