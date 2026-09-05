@@ -6,12 +6,12 @@ use bevy_rapier3d::prelude::*;
 use bevy_replicon::prelude::*;
 use bevy_replicon::shared::backend::connected_client::NetworkId;
 use shared::car_physics::{
-    compute_wheel_forces, default_chassis, wheel_mounts, CarChassis, CarInput, CarInputState,
-    WheelStepInput, CAR_ANGULAR_DAMPING, CAR_LINEAR_DAMPING, CAR_MASS,
+    apply_tuning, compute_wheel_forces, default_chassis, wheel_mounts, CarChassis, CarInput,
+    CarInputState, WheelStepInput, CAR_ANGULAR_DAMPING, CAR_LINEAR_DAMPING, CAR_MASS,
 };
 use shared::combat::{Health, DEFAULT_MAX_HEALTH};
 use shared::protocol::{
-    spawn_car_signature, CarInputMsg, CarResetMsg, CarSnapshot, RegenRequestMsg,
+    spawn_car_signature, CarInputMsg, CarResetMsg, CarSnapshot, RegenRequestMsg, TuneCarMsg,
     WorldRegenMsg,
 };
 use shared::terrain_gen::{find_flat_spawn, height_at, random_seed, TerrainNoise};
@@ -53,6 +53,7 @@ impl Plugin for CarSimPlugin {
             .add_observer(despawn_car_on_disconnect)
             .add_observer(apply_car_input)
             .add_observer(apply_car_reset)
+            .add_observer(apply_car_tune)
             .add_observer(apply_world_regen_request)
             .add_systems(FixedUpdate, step_cars.before(PhysicsSet::SyncBackend))
             .add_systems(Update, recover_lost_cars);
@@ -329,6 +330,39 @@ fn apply_car_reset(
         *velocity = Velocity::zero();
         *ext_force = ExternalForce::default();
         snapshot.reset_generation = snapshot.reset_generation.wrapping_add(1);
+        break;
+    }
+}
+
+/// Authoritative half of the live tuning panel (`Tab`, client's
+/// `tuning_ui.rs`): a player can only ever tune their own car (found via
+/// `OwnedBy`, same authorization shape `RegenRequestMsg`'s op-check already
+/// uses, just scoped to "yourself" rather than "an op"), and every field is
+/// re-clamped here via `apply_tuning` regardless of what the UI already
+/// enforced — the client-side ranges are for slider feel, never trusted as
+/// the actual boundary. `CarChassis` is continuously replicated (see
+/// `register_protocol`), so the new values reach every other connected
+/// client automatically, the same way any other component change would.
+fn apply_car_tune(
+    tune_msg: On<FromClient<TuneCarMsg>>,
+    mut cars: Query<(&OwnedBy, &mut CarChassis)>,
+) {
+    let Some(client_entity) = tune_msg.client_id.entity() else {
+        return;
+    };
+    for (owner, mut chassis) in &mut cars {
+        if owner.0 != client_entity {
+            continue;
+        }
+        apply_tuning(
+            &mut chassis,
+            tune_msg.spring_stiffness,
+            tune_msg.damper,
+            tune_msg.engine_force,
+            tune_msg.brake_force,
+            tune_msg.traction,
+            tune_msg.max_steer_rad,
+        );
         break;
     }
 }

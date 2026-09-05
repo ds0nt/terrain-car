@@ -12,6 +12,7 @@ mod recorder;
 mod tectonic;
 mod terrain;
 mod terrain_material;
+mod tuning_ui;
 mod weapon_fx;
 mod worldspace;
 
@@ -67,6 +68,7 @@ fn main() {
             lightning_fx::LightningFxPlugin,
             bevy_hanabi::HanabiPlugin,
             weapon_fx::WeaponFxPlugin,
+            tuning_ui::TuningUiPlugin,
         ));
 
     // Registers replicated components/events — must use the exact same

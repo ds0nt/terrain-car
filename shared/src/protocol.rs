@@ -135,6 +135,23 @@ pub struct WorldRegenMsg {
     pub origin_z: f64,
 }
 
+/// Sent client -> server from the live tuning panel (`Tab`, see client's
+/// `tuning_ui.rs`) whenever the player drags a slider. Carries every
+/// tunable field at once (not a delta) — simplest to reason about, and
+/// cheap enough at `Ordered` since sliders don't fire every frame. The
+/// server clamps every field to the same ranges the UI itself enforces
+/// before writing them into the sender's own `CarChassis` (never trust
+/// client-side clamping alone) — see `car_sim.rs`'s `apply_car_tune`.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct TuneCarMsg {
+    pub spring_stiffness: f32,
+    pub damper: f32,
+    pub engine_force: f32,
+    pub brake_force: f32,
+    pub traction: f32,
+    pub max_steer_rad: f32,
+}
+
 /// Sent client -> server when the player fires the front-mounted gun.
 /// Carries nothing: the server already knows who's shooting (the sending
 /// client's own car) and reads that car's current `Transform` for the
@@ -188,17 +205,22 @@ pub struct LightningStrikeMsg {
 /// on startup so registration order — which determines wire IDs — can never
 /// drift between them.
 pub fn register_protocol(app: &mut App) {
-    app.replicate_once::<CarChassis>()
+    app
+        // Was replicate_once: with the live tuning panel (TuneCarMsg), a
+        // car's chassis stats can now change after spawn, and every
+        // connected client needs to see that change too, not just the
+        // player who tuned it.
+        .replicate::<CarChassis>()
         .replicate::<CarSnapshot>()
-        // Unlike CarChassis's one-shot tuning data, health changes
-        // constantly once guns exist — every client needs to see it live,
-        // not just once at spawn.
+        // Health changes constantly once guns exist — every client needs
+        // to see it live, not just once at spawn.
         .replicate::<Health>()
         .add_client_event::<CarInputMsg>(Channel::Unreliable)
         .add_client_event::<CarResetMsg>(Channel::Ordered)
         .add_client_event::<RegenRequestMsg>(Channel::Ordered)
         .add_client_event::<FireGunMsg>(Channel::Unreliable)
         .add_server_event::<GunFiredMsg>(Channel::Unreliable)
+        .add_client_event::<TuneCarMsg>(Channel::Ordered)
         .add_server_event::<WorldRegenMsg>(Channel::Ordered)
         // Unreliable: purely cosmetic, and another strike is at most 10s
         // away anyway, so a dropped one is never worth retransmitting.

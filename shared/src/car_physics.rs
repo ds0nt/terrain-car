@@ -84,8 +84,8 @@ pub const CAR_ANGULAR_DAMPING: f32 = 3.5;
 /// The one set of tuning constants every car uses. Shared so the server's
 /// authoritative spawn and the client's locally-predicted spawn (see
 /// `protocol::LocalCar`) can never quietly drift apart before the server's
-/// `replicate_once::<CarChassis>()` echo even arrives — a client running
-/// even slightly different numbers would mispredict every tick.
+/// replicated `CarChassis` echo even arrives — a client running even
+/// slightly different numbers would mispredict every tick.
 pub fn default_chassis() -> CarChassis {
     let half_extents = Vec3::new(0.9, 0.35, 1.9);
     CarChassis {
@@ -109,6 +109,44 @@ pub fn default_chassis() -> CarChassis {
         // overwriting it.
         color_seed: 0,
     }
+}
+
+/// Slider ranges for the live tuning panel (client's `tuning_ui.rs`) and
+/// the server's authoritative clamp on `TuneCarMsg` (`car_sim.rs`'s
+/// `apply_car_tune`) — defined once here so the two can never disagree
+/// (a UI slider showing a wider range than the server actually accepts
+/// would silently snap back, which reads as a broken slider). Centered
+/// loosely around `default_chassis()`'s own values; deliberately excludes
+/// `half_extents`/`wheel_radius`, which drive the fixed mesh/collider
+/// shape — live-resizing those is a separate, much bigger problem (mesh
+/// regen, collider replacement, wheel remount recompute).
+pub const SPRING_STIFFNESS_RANGE: (f32, f32) = (20_000.0, 120_000.0);
+pub const DAMPER_RANGE: (f32, f32) = (2_000.0, 20_000.0);
+pub const ENGINE_FORCE_RANGE: (f32, f32) = (8_000.0, 45_000.0);
+pub const BRAKE_FORCE_RANGE: (f32, f32) = (5_000.0, 40_000.0);
+pub const TRACTION_RANGE: (f32, f32) = (3_000.0, 25_000.0);
+pub const MAX_STEER_RAD_RANGE: (f32, f32) = (10f32.to_radians(), 50f32.to_radians());
+
+/// Clamps every tunable field of a `TuneCarMsg`-shaped set of values to the
+/// ranges above and writes them into `chassis` — the one place both the
+/// server (authoritative) and nothing else need to agree on, since the
+/// client-side UI enforces the same ranges only for a good slider *feel*,
+/// never as the actual security boundary.
+pub fn apply_tuning(
+    chassis: &mut CarChassis,
+    spring_stiffness: f32,
+    damper: f32,
+    engine_force: f32,
+    brake_force: f32,
+    traction: f32,
+    max_steer_rad: f32,
+) {
+    chassis.spring_stiffness = spring_stiffness.clamp(SPRING_STIFFNESS_RANGE.0, SPRING_STIFFNESS_RANGE.1);
+    chassis.damper = damper.clamp(DAMPER_RANGE.0, DAMPER_RANGE.1);
+    chassis.engine_force = engine_force.clamp(ENGINE_FORCE_RANGE.0, ENGINE_FORCE_RANGE.1);
+    chassis.brake_force = brake_force.clamp(BRAKE_FORCE_RANGE.0, BRAKE_FORCE_RANGE.1);
+    chassis.traction = traction.clamp(TRACTION_RANGE.0, TRACTION_RANGE.1);
+    chassis.max_steer_rad = max_steer_rad.clamp(MAX_STEER_RAD_RANGE.0, MAX_STEER_RAD_RANGE.1);
 }
 
 /// Local (chassis-space) mount point and is-front flag for each of the 4
