@@ -10,15 +10,21 @@ use shared::protocol::{CarInputMsg, CarSnapshot, LocalCar};
 /// realistic RTT (a few hundred ms at 64Hz is a few dozen ticks; 128 covers
 /// ~2s, comfortably past what reconciliation ever needs to look back).
 const HISTORY_CAP: usize = 128;
+/// Position error below this is ignored outright — ordinary floating-point/
+/// timing jitter between two independent Rapier instances running the same
+/// input, not worth reacting to at all. Without this dead zone, *every*
+/// snapshot nudges the car by a little, which reads as the car fighting the
+/// player's own accelerating/braking input rather than driving cleanly.
+const DEAD_ZONE_METERS: f32 = 0.08;
 /// Position error below this blends in smoothly over several snapshots —
 /// normal float drift / minor desync, never visible as a pop.
-const SMALL_ERROR_METERS: f32 = 0.5;
-const SOFT_CORRECTION_FACTOR: f32 = 0.2;
+const SMALL_ERROR_METERS: f32 = 1.0;
+const SOFT_CORRECTION_FACTOR: f32 = 0.08;
 /// A real desync (e.g. a collision the client didn't predict) still isn't
 /// teleported — corrected faster than the soft case, but as a glide over a
 /// handful of snapshots rather than an instant snap. See prediction.rs
 /// module docs for why this isn't full input-replay reconciliation.
-const HARD_CORRECTION_FACTOR: f32 = 0.6;
+const HARD_CORRECTION_FACTOR: f32 = 0.35;
 
 /// Client-side prediction with server reconciliation for the local
 /// player's own car (see the multiplayer plan's "Networking model"
@@ -179,14 +185,31 @@ fn reconcile_with_server(
     };
 
     let error = snapshot.translation - predicted.translation;
-    let correction = if error.length() < SMALL_ERROR_METERS {
-        SOFT_CORRECTION_FACTOR
-    } else {
+    let error_len = error.length();
+    if error_len < DEAD_ZONE_METERS {
+        // Close enough to call it agreement — leave the car's momentum
+        // entirely alone rather than tugging it toward a barely-different
+        // echo of where it already is.
+        return;
+    }
+    let is_hard = error_len >= SMALL_ERROR_METERS;
+    let correction = if is_hard {
         HARD_CORRECTION_FACTOR
+    } else {
+        SOFT_CORRECTION_FACTOR
     };
 
     transform.translation += error * correction;
     transform.rotation = transform.rotation.slerp(snapshot.rotation, correction);
-    velocity.linear = velocity.linear.lerp(snapshot.linear_velocity, correction);
-    velocity.angular = velocity.angular.lerp(snapshot.angular_velocity, correction);
+
+    // Velocity carries the feel of momentum, so it stays fully
+    // client-dictated for ordinary small drift — only a real desync (a hard
+    // correction) pulls it toward the server's echo, since blending it even
+    // a little on every snapshot was fighting the player's own
+    // accelerating/braking input and reading as stiff, over-corrected
+    // physics rather than a car that responds to its own throttle.
+    if is_hard {
+        velocity.linear = velocity.linear.lerp(snapshot.linear_velocity, correction);
+        velocity.angular = velocity.angular.lerp(snapshot.angular_velocity, correction);
+    }
 }
