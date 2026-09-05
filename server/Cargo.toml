@@ -25,3 +25,4 @@ bevy_rapier3d = { version = "0.36.0", default-features = false, features = ["dim
 bevy_replicon = "0.44.0"
 bevy_replicon_renet = "0.20.0"
 rand = "0.8"
+uuid = { version = "1.26.0", features = ["serde"] }

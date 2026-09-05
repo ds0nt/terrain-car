@@ -11,9 +11,10 @@ use shared::car_physics::{
 };
 use shared::combat::{Health, DEFAULT_MAX_HEALTH};
 use shared::protocol::{
-    spawn_car_signature, CarInputMsg, CarResetMsg, CarSnapshot, RegenRequestMsg, TuneCarMsg,
-    WorldRegenMsg,
+    spawn_car_signature, CarInputMsg, CarResetMsg, CarSnapshot, IdentifyMsg, RegenRequestMsg,
+    TuneCarMsg, WorldRegenMsg,
 };
+use uuid::Uuid;
 use shared::terrain_gen::{find_flat_spawn, height_at, random_seed, TerrainNoise};
 use shared::worldspace::WorldOrigin;
 
@@ -49,11 +50,13 @@ impl Plugin for CarSimPlugin {
             .init_resource::<SpawnAnchor>()
             .init_resource::<OpList>()
             .init_resource::<CurrentWorldState>()
+            .init_resource::<PlayerIdentities>()
             .add_observer(spawn_car_on_connect)
             .add_observer(despawn_car_on_disconnect)
             .add_observer(apply_car_input)
             .add_observer(apply_car_reset)
             .add_observer(apply_car_tune)
+            .add_observer(apply_identify)
             .add_observer(apply_world_regen_request)
             .add_systems(FixedUpdate, step_cars.before(PhysicsSet::SyncBackend))
             .add_systems(Update, recover_lost_cars);
@@ -93,6 +96,33 @@ impl PlayerRegistry {
     pub fn iter(&self) -> impl Iterator<Item = (u32, Entity)> + '_ {
         self.by_index.iter().map(|(&i, &e)| (i, e))
     }
+}
+
+/// Maps a connected client's live `Entity` to their stable, cross-session
+/// `PersistentPlayerId` (see client's `net.rs`) — the bridge between
+/// ephemeral per-connection state (`OwnedBy(Entity)`, which stops existing
+/// the moment someone disconnects) and anything that needs to survive a
+/// reconnect or a server restart (buildings/wallets, once those exist —
+/// see the base-building plan). Populated by `apply_identify`, which the
+/// client resends every couple of seconds rather than relying on a single
+/// attempt racing connection setup — see `IdentifyMsg`'s own docs.
+#[derive(Resource, Default)]
+pub struct PlayerIdentities(HashMap<Entity, Uuid>);
+
+impl PlayerIdentities {
+    fn remove(&mut self, client_entity: Entity) {
+        self.0.remove(&client_entity);
+    }
+}
+
+fn apply_identify(
+    identify: On<FromClient<IdentifyMsg>>,
+    mut identities: ResMut<PlayerIdentities>,
+) {
+    let Some(client_entity) = identify.client_id.entity() else {
+        return;
+    };
+    identities.0.insert(client_entity, identify.player_id);
 }
 
 /// Client entities currently holding operator privileges (granted/revoked
@@ -258,10 +288,15 @@ fn despawn_car_on_disconnect(
     cars: Query<(Entity, &OwnedBy)>,
     mut registry: ResMut<PlayerRegistry>,
     mut op_list: ResMut<OpList>,
+    mut identities: ResMut<PlayerIdentities>,
 ) {
     let client_entity = remove.entity;
     registry.remove(client_entity);
     op_list.revoke(client_entity);
+    // Bevy can recycle a despawned Entity id for a later, unrelated
+    // connection — leaving a stale mapping here would let that new
+    // connection silently inherit a previous player's identity.
+    identities.remove(client_entity);
     for (car_entity, owner) in &cars {
         if owner.0 == client_entity {
             commands.entity(car_entity).despawn();

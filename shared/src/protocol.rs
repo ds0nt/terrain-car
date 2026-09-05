@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use bevy_replicon::prelude::*;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::car_physics::CarChassis;
 use crate::combat::Health;
@@ -135,6 +136,22 @@ pub struct WorldRegenMsg {
     pub origin_z: f64,
 }
 
+/// Sent client -> server repeatedly (every couple of seconds — see client's
+/// `net.rs`) rather than exactly once, since there's no explicit "you are
+/// now connected" signal this game currently listens for and a single
+/// fire-at-Startup attempt could race the transport actually being ready.
+/// The server treats every receipt as idempotent (just records/overwrites
+/// the mapping — see `car_sim.rs`'s `PlayerIdentities`), so re-sending is
+/// harmless. `player_id` is a UUID generated once and saved to a local
+/// file on first launch (see `net.rs`'s `load_or_create_player_id`) rather
+/// than derived from anything connection-specific — it's the one piece of
+/// "who is this, across every future session" identity buildings/wallets
+/// (a later addition) key off, unlike `LocalCar`'s per-connection id.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct IdentifyMsg {
+    pub player_id: Uuid,
+}
+
 /// Sent client -> server from the live tuning panel (`Tab`, see client's
 /// `tuning_ui.rs`) whenever the player drags a slider. Carries every
 /// tunable field at once (not a delta) — simplest to reason about, and
@@ -221,6 +238,7 @@ pub fn register_protocol(app: &mut App) {
         .add_client_event::<FireGunMsg>(Channel::Unreliable)
         .add_server_event::<GunFiredMsg>(Channel::Unreliable)
         .add_client_event::<TuneCarMsg>(Channel::Ordered)
+        .add_client_event::<IdentifyMsg>(Channel::Ordered)
         .add_server_event::<WorldRegenMsg>(Channel::Ordered)
         // Unreliable: purely cosmetic, and another strike is at most 10s
         // away anyway, so a dropped one is never worth retransmitting.

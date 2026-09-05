@@ -1,2 +1,5 @@
 /target
 /dist
+# Per-machine persistent player identity (client/src/net.rs) — generated
+# on first launch, never meant to be shared/committed.
+player_id.txt

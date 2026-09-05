@@ -6,6 +6,8 @@ use bevy_replicon::prelude::*;
 use bevy_replicon_renet::netcode::{ClientAuthentication, NetcodeClientTransport};
 use bevy_replicon_renet::renet::ConnectionConfig;
 use bevy_replicon_renet::{RenetChannelsExt, RenetClient, RepliconRenetPlugins};
+use shared::protocol::IdentifyMsg;
+use uuid::Uuid;
 
 /// Must match server/src/net.rs's constant exactly — a client with a
 /// different value gets a clean rejection instead of garbled replication.
@@ -16,9 +18,66 @@ pub struct ClientNetPlugin;
 
 impl Plugin for ClientNetPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(RepliconRenetPlugins)
-            .add_systems(Startup, connect_to_server);
+        app.init_resource::<PersistentPlayerId>()
+            .add_plugins(RepliconRenetPlugins)
+            .add_systems(Startup, connect_to_server)
+            .add_systems(Update, send_identify);
     }
+}
+
+/// Where the persistent player id lives on disk — CWD-relative, matching
+/// this project's other simple file conventions (e.g. the recorder's
+/// `data/drivedata2_terrain/`), rather than pulling in a directories crate
+/// just to compute a platform-specific config path for one small file.
+const PLAYER_ID_PATH: &str = "player_id.txt";
+
+/// A UUID generated once on first launch and saved to `PLAYER_ID_PATH`,
+/// read back on every launch after that — this machine's stable "who is
+/// this player" identity across every future session, unlike
+/// `LocalClientId`/`NetworkId` (per-connection) or `OwnedBy(Entity)`
+/// (stops existing the moment someone disconnects). Sent to the server via
+/// `IdentifyMsg` (see `send_identify`); nothing yet keys persistent state
+/// off this (no buildings/wallets exist), but it's the foundation those
+/// need — see the base-building plan's Phase 0 for why.
+#[derive(Resource, Clone, Copy)]
+pub struct PersistentPlayerId(pub Uuid);
+
+impl Default for PersistentPlayerId {
+    fn default() -> Self {
+        Self(load_or_create_player_id())
+    }
+}
+
+fn load_or_create_player_id() -> Uuid {
+    if let Ok(contents) = std::fs::read_to_string(PLAYER_ID_PATH)
+        && let Ok(id) = Uuid::parse_str(contents.trim())
+    {
+        return id;
+    }
+    let id = Uuid::new_v4();
+    if let Err(e) = std::fs::write(PLAYER_ID_PATH, id.to_string()) {
+        warn!("net: failed to persist player id to {PLAYER_ID_PATH}: {e}");
+    }
+    id
+}
+
+/// Resends `IdentifyMsg` every couple of seconds for as long as this
+/// client runs — see that message's own docs for why repeating beats a
+/// single fire-at-Startup attempt.
+const IDENTIFY_RESEND_SECS: f32 = 2.0;
+
+fn send_identify(
+    time: Res<Time>,
+    player_id: Res<PersistentPlayerId>,
+    mut commands: Commands,
+    mut timer: Local<f32>,
+) {
+    *timer -= time.delta_secs();
+    if *timer > 0.0 {
+        return;
+    }
+    *timer = IDENTIFY_RESEND_SECS;
+    commands.client_trigger(IdentifyMsg { player_id: player_id.0 });
 }
 
 /// This client's own renet connection id, generated once up front (see
@@ -29,6 +88,17 @@ impl Plugin for ClientNetPlugin {
 /// across different plugins have no guaranteed relative order, so both
 /// sides reading one pre-computed resource is simpler than trying to order
 /// two Startup systems against each other.
+///
+/// Deliberately still time-based, *not* derived from `PersistentPlayerId`
+/// — tried that first, and it broke reconnecting: renet's own
+/// replay/duplicate-connection protection rejects a new connection
+/// attempt that reuses the same transport-level `client_id` too soon after
+/// the previous one using it disconnected, and a stable id makes every
+/// relaunch from the same machine collide with that window. This field's
+/// only job is "distinguish concurrent transport-level connections," which
+/// a fresh value every launch does correctly; genuine cross-session player
+/// identity flows entirely through `PersistentPlayerId`/`IdentifyMsg`
+/// instead, kept deliberately decoupled from this one.
 #[derive(Resource, Clone, Copy)]
 pub struct LocalClientId(pub u64);
 
