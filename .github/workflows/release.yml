@@ -46,6 +46,9 @@ jobs:
           mkdir -p pkg/terrain-car-client-linux-x64
           cp target/release/terrain_car pkg/terrain-car-client-linux-x64/
           cp README.md pkg/terrain-car-client-linux-x64/
+          # Bevy looks for "assets" next to the running executable, not next
+          # to wherever it was built — has to ship in the same tarball.
+          cp -r client/assets pkg/terrain-car-client-linux-x64/assets
           tar -cJf terrain-car-client-linux-x64.tar.xz -C pkg terrain-car-client-linux-x64
 
       - name: Package server

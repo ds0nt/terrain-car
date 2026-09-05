@@ -13,6 +13,7 @@ use shared::terrain_gen::{
     TerrainNoise, CHUNK_RESOLUTION, CHUNK_SIZE,
 };
 
+use crate::terrain_material::TerrainMaterial;
 use crate::worldspace::WorldOrigin;
 
 // Chunked, streamed terrain: chunks spawn/despawn around whatever entity
@@ -152,7 +153,7 @@ fn spawn_chunk(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
-    material: Handle<StandardMaterial>,
+    terrain_material: Handle<TerrainMaterial>,
     noise: &TerrainNoise,
     origin: &WorldOrigin,
     coord: ChunkCoord,
@@ -168,7 +169,7 @@ fn spawn_chunk(
     commands
         .spawn((
             Mesh3d(meshes.add(mesh)),
-            MeshMaterial3d(material),
+            MeshMaterial3d(terrain_material),
             Transform::from_translation(local_center),
             RigidBody::Fixed,
             Collider::heightfield(
@@ -257,21 +258,32 @@ fn spawn_initial_chunks(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
     noise: Res<TerrainNoise>,
     origin: Res<WorldOrigin>,
     mut loaded: ResMut<LoadedChunks>,
 ) {
-    let material = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        perceptual_roughness: 0.95,
-        ..default()
+    let terrain_material = terrain_materials.add(TerrainMaterial {
+        base: StandardMaterial {
+            base_color: Color::WHITE,
+            perceptual_roughness: 0.95,
+            ..default()
+        },
+        extension: default(),
     });
 
     for x in -LOAD_RADIUS_CHUNKS..=LOAD_RADIUS_CHUNKS {
         for z in -LOAD_RADIUS_CHUNKS..=LOAD_RADIUS_CHUNKS {
             let coord = (x, z);
-            let entity =
-                spawn_chunk(&mut commands, &mut meshes, &mut materials, material.clone(), &noise, &origin, coord);
+            let entity = spawn_chunk(
+                &mut commands,
+                &mut meshes,
+                &mut materials,
+                terrain_material.clone(),
+                &noise,
+                &origin,
+                coord,
+            );
             loaded.chunks.insert(coord, entity);
         }
     }
@@ -318,11 +330,12 @@ fn stream_chunks(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
     noise: Res<TerrainNoise>,
     origin: Res<WorldOrigin>,
     mut loaded: ResMut<LoadedChunks>,
     tracker: Query<&GlobalTransform, With<TerrainTracker>>,
-    existing_material: Query<&MeshMaterial3d<StandardMaterial>, With<TerrainChunk>>,
+    existing_material: Query<&MeshMaterial3d<TerrainMaterial>, With<TerrainChunk>>,
 ) {
     let Ok(tracker_gt) = tracker.single() else {
         return;
@@ -352,23 +365,33 @@ fn stream_chunks(
     loaded.pending.extend(wanted);
     loaded.pending.sort_by_key(|c| dist2(*c));
 
-    let material = existing_material
+    let terrain_material = existing_material
         .iter()
         .next()
         .map(|m| m.0.clone())
         .unwrap_or_else(|| {
-            materials.add(StandardMaterial {
-                base_color: Color::WHITE,
-                perceptual_roughness: 0.95,
-                ..default()
+            terrain_materials.add(TerrainMaterial {
+                base: StandardMaterial {
+                    base_color: Color::WHITE,
+                    perceptual_roughness: 0.95,
+                    ..default()
+                },
+                extension: default(),
             })
         });
 
     let spawn_count = loaded.pending.len().min(CHUNKS_SPAWNED_PER_FRAME);
     let to_spawn: Vec<ChunkCoord> = loaded.pending.drain(..spawn_count).collect();
     for coord in to_spawn {
-        let entity =
-            spawn_chunk(&mut commands, &mut meshes, &mut materials, material.clone(), &noise, &origin, coord);
+        let entity = spawn_chunk(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            terrain_material.clone(),
+            &noise,
+            &origin,
+            coord,
+        );
         loaded.chunks.insert(coord, entity);
     }
 

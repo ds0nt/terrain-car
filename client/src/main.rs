@@ -9,6 +9,7 @@ mod prediction;
 mod recorder;
 mod tectonic;
 mod terrain;
+mod terrain_material;
 mod worldspace;
 
 use bevy::prelude::*;
@@ -43,6 +44,7 @@ fn main() {
             RepliconPlugins,
             net::ClientNetPlugin,
             worldspace::WorldSpacePlugin,
+            terrain_material::TerrainMaterialPlugin,
             terrain::TerrainPlugin,
             car::CarPlugin,
             car_render::CarRenderPlugin,
@@ -50,6 +52,11 @@ fn main() {
             camera::CameraPlugin,
             lighting::LightingPlugin,
             hud::HudPlugin,
+        ))
+        // `add_plugins` only accepts tuples up to a fixed arity, and the
+        // list above is already at that limit — a second call rather than
+        // one giant tuple.
+        .add_plugins((
             minimap::MinimapPlugin,
             recorder::RecorderPlugin,
             tectonic::TectonicPlugin,
