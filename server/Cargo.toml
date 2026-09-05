@@ -1,0 +1,26 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "terrain_car_server"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../shared" }
+# Full default features for now, matching shared/client — see shared/Cargo.toml's
+# comment. Building this binary with `-p server` alone (not `--workspace`,
+# which unifies features across every member built together) is what
+# actually keeps it lean until that follow-up lands, since Cargo only
+# unifies feature flags across crates it's building in the same invocation.
+bevy = "0.19.1"
+# `default-features = false` here is the part that actually matters at
+# compile time (unlike bevy's own flags, which need more feature-graph
+# research to safely slim — see shared/Cargo.toml): the default feature set
+# pulls in `debug-render-3d`/`picking-backend`/`to-bevy-mesh`, each of which
+# drags in bevy_render and friends purely for optional rendering conveniences
+# a server never uses. `dim3` is the actual physics engine.
+bevy_rapier3d = { version = "0.36.0", default-features = false, features = ["dim3"] }
+bevy_replicon = "0.44.0"
+bevy_replicon_renet = "0.20.0"

@@ -1,0 +1,16 @@
+[package]
+name = "shared"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Full default features for now (step 1 of the multiplayer refactor is a
+# pure workspace split with zero behavior change). Once the headless server
+# binary exists (plan step 3), revisit this with `default-features = false`
+# and only the specific sub-crates (bevy_math, bevy_color, bevy_ecs) that
+# the pure terrain/car-physics functions here actually need, so the server
+# build doesn't drag in rendering deps through this crate.
+bevy = { version = "0.19.1", features = ["serialize"] }
+bevy_replicon = "0.44.0"
+noise = "0.9.0"
+serde = { version = "1.0.229", features = ["derive"] }

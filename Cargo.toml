@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["shared", "client", "server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+# Bevy's own recommendation: an unoptimized dev build of bevy/rapier/glam is
+# the single biggest FPS killer during development. Keep our own crates fast
+# to recompile (opt-level 1) but always optimize dependencies. Workspace-level
+# profiles apply to every member automatically.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
