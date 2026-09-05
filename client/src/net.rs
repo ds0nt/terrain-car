@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::SystemTime;
 
 use bevy::prelude::*;
@@ -24,11 +24,33 @@ impl Plugin for ClientNetPlugin {
 fn connect_to_server(mut commands: Commands, channels: Res<RepliconChannels>) {
     // `TERRAIN_CAR_SERVER=host:port cargo run` to connect elsewhere;
     // defaults to loopback for local testing (server + one client on the
-    // same machine).
-    let server_addr: SocketAddr = std::env::var("TERRAIN_CAR_SERVER")
-        .ok()
-        .and_then(|addr| addr.parse().ok())
-        .unwrap_or_else(|| DEFAULT_SERVER_ADDR.parse().unwrap());
+    // same machine). Resolved via `ToSocketAddrs` (does a real DNS lookup)
+    // rather than `SocketAddr::parse` (which only accepts a literal IP) —
+    // the latter silently falling back to the loopback default on any
+    // hostname was a real bug: it meant a mistyped or unresolvable address
+    // connected to *localhost* instead of failing loudly.
+    let server_env = std::env::var("TERRAIN_CAR_SERVER").unwrap_or_default();
+    let target = if server_env.is_empty() {
+        DEFAULT_SERVER_ADDR
+    } else {
+        server_env.as_str()
+    };
+    let resolved: Vec<SocketAddr> = target
+        .to_socket_addrs()
+        .unwrap_or_else(|e| panic!("failed to resolve TERRAIN_CAR_SERVER `{target}`: {e}"))
+        .collect();
+    // Prefer IPv4: the server only binds an IPv4 unspecified address (see
+    // server/src/net.rs), but a hostname lookup (Tailscale MagicDNS names
+    // in particular, which have both a 100.x.y.z IPv4 and an fd7a:...
+    // IPv6 address) can return the IPv6 result first — silently trying
+    // that would just hang against a server that was never listening on
+    // it.
+    let server_addr = resolved
+        .iter()
+        .find(|addr| addr.is_ipv4())
+        .or_else(|| resolved.first())
+        .copied()
+        .unwrap_or_else(|| panic!("`{target}` resolved to no addresses"));
 
     let client = RenetClient::new(ConnectionConfig {
         server_channels_config: channels.server_configs(),
