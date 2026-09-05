@@ -2,6 +2,7 @@ mod car_sim;
 mod console;
 mod lightning;
 mod net;
+mod physics_fx;
 mod terrain_phys;
 
 use std::time::Duration;

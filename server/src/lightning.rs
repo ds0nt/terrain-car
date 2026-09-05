@@ -7,6 +7,8 @@ use shared::car_physics::CarChassis;
 use shared::protocol::LightningStrikeMsg;
 use shared::worldspace::WorldOrigin;
 
+use crate::physics_fx::apply_radial_impulse;
+
 /// How often lightning strikes, in seconds — a new random interval in this
 /// range is rolled after every strike, so it never settles into a
 /// predictable rhythm. Purely cosmetic chaos ("because god is angry"), so
@@ -55,14 +57,11 @@ impl Default for LightningTimer {
 /// Ticks the strike timer on real (variable) time — this is cosmetic chaos
 /// with no replay-determinism requirement, unlike car physics, so there's
 /// no need for `FixedUpdate` lockstep here. When it fires: picks a strike
-/// point near a random car, kicks the `Velocity` of every car within blast
-/// radius directly (the same direct-mutation pattern `recover_lost_cars`
-/// already uses — Rapier picks it up on the very next physics step
-/// regardless of which schedule set it), and broadcasts
-/// `LightningStrikeMsg` so every client renders the same boom in the same
-/// place. The knockback itself needs no separate network message: it
-/// reaches clients through the `CarSnapshot` replication that already
-/// exists for ordinary driving.
+/// point near a random car, kicks every car within blast radius via
+/// `physics_fx::apply_radial_impulse`, and broadcasts `LightningStrikeMsg`
+/// so every client renders the same boom in the same place. The knockback
+/// itself needs no separate network message: it reaches clients through
+/// the `CarSnapshot` replication that already exists for ordinary driving.
 fn strike_lightning(
     time: Res<Time>,
     mut timer: ResMut<LightningTimer>,
@@ -95,32 +94,15 @@ fn strike_lightning(
     );
     let strike_local = (strike_true - origin.offset).as_vec3();
 
-    for (transform, mut velocity) in &mut cars {
-        let delta = Vec3::new(
-            transform.translation.x - strike_local.x,
-            0.0,
-            transform.translation.z - strike_local.z,
-        );
-        let car_dist = delta.length();
-        if car_dist >= BLAST_RADIUS {
-            continue;
-        }
-        let falloff = {
-            let t = 1.0 - car_dist / BLAST_RADIUS;
-            t * t
-        };
-        let away = if car_dist > 0.01 { delta / car_dist } else { Vec3::X };
-
-        velocity.linear += away * BLAST_MAX_DELTA_V * falloff + Vec3::Y * BLAST_UPWARD_DELTA_V * falloff;
-
-        let spin_axis = Vec3::new(
-            rng.gen_range(-1.0..1.0),
-            rng.gen_range(-1.0..1.0),
-            rng.gen_range(-1.0..1.0),
-        )
-        .normalize_or_zero();
-        velocity.angular += spin_axis * BLAST_MAX_ANGULAR_DELTA * falloff;
-    }
+    apply_radial_impulse(
+        &mut cars,
+        strike_local,
+        BLAST_RADIUS,
+        BLAST_MAX_DELTA_V,
+        BLAST_UPWARD_DELTA_V,
+        BLAST_MAX_ANGULAR_DELTA,
+        &mut rng,
+    );
 
     commands.server_trigger(ToClients {
         targets: SendTargets::All,

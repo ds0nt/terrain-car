@@ -1,6 +1,7 @@
 mod camera;
 mod car;
 mod car_render;
+mod fx;
 mod hud;
 mod lighting;
 mod lightning_fx;
@@ -61,6 +62,7 @@ fn main() {
             minimap::MinimapPlugin,
             recorder::RecorderPlugin,
             tectonic::TectonicPlugin,
+            fx::FxPlugin,
             lightning_fx::LightningFxPlugin,
         ));
 
