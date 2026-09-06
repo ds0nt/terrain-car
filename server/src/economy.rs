@@ -1,0 +1,308 @@
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use bevy::prelude::*;
+use bevy_rapier3d::prelude::*;
+use bevy_replicon::prelude::*;
+use uuid::Uuid;
+
+use shared::buildings::{BuildingKind, STARTING_ENERGY, STARTING_ORE};
+use shared::deposits::is_near_deposit;
+use shared::protocol::{
+    BuildingSnapshot, CarSnapshot, IdentifyMsg, PlaceBuildingMsg, RecallToHangarMsg,
+};
+use shared::terrain_gen::{height_at, TerrainNoise};
+use shared::worldspace::WorldOrigin;
+
+use crate::car_sim::{OwnedBy, PlayerIdentities};
+use crate::persistence::{BuildingRow, Persistence, PersistenceCommand, PersistenceEvent, WalletRow};
+
+/// How close (true-space) a placement request must be to the sender's own
+/// current position — placement is "where your car is," not an arbitrary
+/// point the client could otherwise claim. Generous enough to allow for
+/// normal input/network lag between "player pressed place" and the
+/// server processing it, nowhere near enough to place across the map.
+const MAX_PLACEMENT_DISTANCE: f64 = 25.0;
+/// How often buildings actually produce resources — economy-scale time,
+/// not the 64Hz physics tick.
+const PRODUCTION_TICK_SECS: f32 = 1.0;
+
+pub struct EconomyPlugin;
+
+impl Plugin for EconomyPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<Wallets>()
+            .insert_resource(ProductionTimer(Timer::from_seconds(
+                PRODUCTION_TICK_SECS,
+                TimerMode::Repeating,
+            )))
+            .add_observer(seed_wallet_on_identify)
+            .add_observer(apply_place_building)
+            .add_observer(apply_recall_to_hangar)
+            .add_systems(Update, (apply_loaded_state, tick_production));
+    }
+}
+
+fn now_unix() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is set before the Unix epoch")
+        .as_secs_f64()
+}
+
+/// Server-authoritative in-memory wallets, keyed by the durable
+/// `PersistentPlayerId` (not `Entity` — a wallet must outlive any single
+/// connection). Postgres (`persistence.rs`) is a write-behind mirror of
+/// this, never the other way around: gameplay always reads/writes this
+/// map directly, same "fast in-memory state, slow persistence layer only
+/// on the side" principle as the rest of the base-building plan.
+#[derive(Resource, Default)]
+pub struct Wallets(HashMap<Uuid, (f32, f32)>);
+
+impl Wallets {
+    fn get_or_seed(&mut self, player_id: Uuid) -> (f32, f32) {
+        *self.0.entry(player_id).or_insert((STARTING_ENERGY, STARTING_ORE))
+    }
+}
+
+#[derive(Resource)]
+struct ProductionTimer(Timer);
+
+/// Gives a brand-new player their starting wallet the moment they're
+/// first identified — nothing else would ever seed one otherwise (no
+/// production without a building, no building without funds to place it).
+/// A player already known (either from a previous `IdentifyMsg` this
+/// session, or loaded from Postgres at startup — see `apply_loaded_state`)
+/// is left untouched.
+fn seed_wallet_on_identify(
+    identify: On<FromClient<IdentifyMsg>>,
+    mut wallets: ResMut<Wallets>,
+    persistence: Res<Persistence>,
+) {
+    if wallets.0.contains_key(&identify.player_id) {
+        return;
+    }
+    let (energy, ore) = wallets.get_or_seed(identify.player_id);
+    persistence.send(PersistenceCommand::SaveWallet(WalletRow {
+        player_id: identify.player_id,
+        energy: energy as f64,
+        ore: ore as f64,
+    }));
+}
+
+/// Applies whatever the persistence thread has loaded (in practice: once,
+/// shortly after server startup) into the live in-memory `Wallets` map and
+/// spawns a replicated `BuildingSnapshot` per loaded building. The sole
+/// consumer of `Persistence::try_recv` — see that method's own docs on why
+/// `persistence.rs` itself has no opinion on what the loaded rows mean.
+fn apply_loaded_state(
+    mut commands: Commands,
+    persistence: Res<Persistence>,
+    mut wallets: ResMut<Wallets>,
+) {
+    while let Some(event) = persistence.try_recv() {
+        match event {
+            PersistenceEvent::Loaded { wallets: loaded_wallets, buildings } => {
+                for wallet in loaded_wallets {
+                    wallets.0.insert(wallet.player_id, (wallet.energy as f32, wallet.ore as f32));
+                }
+                for building in buildings {
+                    spawn_building_from_row(&mut commands, &building);
+                }
+                info!(
+                    "economy: applied {} loaded wallet(s)",
+                    wallets.0.len()
+                );
+            }
+            PersistenceEvent::Unavailable => {
+                warn!("economy: running without a database — wallets/buildings will not persist");
+            }
+        }
+    }
+}
+
+fn spawn_building_from_row(commands: &mut Commands, row: &BuildingRow) {
+    let Some(kind) = BuildingKind::from_db_str(&row.kind) else {
+        warn!("economy: ignoring building {} with unknown kind `{}`", row.id, row.kind);
+        return;
+    };
+    commands.spawn((
+        BuildingSnapshot {
+            kind,
+            owner_player_id: row.owner_player_id,
+            true_x: row.true_x,
+            true_z: row.true_z,
+            build_complete_at: row.build_complete_at.unwrap_or(0.0),
+        },
+        Replicated,
+    ));
+}
+
+/// Resolves one `PlaceBuildingMsg`: validates the sender is identified,
+/// affordable, close enough to their claimed position, and (for
+/// `ExtractionFacility`) actually on a deposit — never trusts the client
+/// on any of these, same trust boundary as every other client -> server
+/// message in this game. On success, deducts the cost immediately and
+/// spawns a replicated `BuildingSnapshot` with `build_complete_at` in the
+/// future.
+fn apply_place_building(
+    place: On<FromClient<PlaceBuildingMsg>>,
+    identities: Res<PlayerIdentities>,
+    origin: Res<WorldOrigin>,
+    mut wallets: ResMut<Wallets>,
+    persistence: Res<Persistence>,
+    mut commands: Commands,
+    cars: Query<(&OwnedBy, &Transform)>,
+) {
+    let Some(client_entity) = place.client_id.entity() else {
+        return;
+    };
+    let Some(player_id) = identities.get(client_entity) else {
+        warn!("economy: build request from an unidentified client — ignoring");
+        return;
+    };
+
+    // The sender's own car's current *true* position (not the local
+    // Transform directly — those are only equal before the world's first
+    // rebase, see WorldOrigin's docs), to bound how far "where I am" is
+    // allowed to claim to be.
+    let Some((_, car_transform)) = cars.iter().find(|(owner, _)| owner.0 == client_entity) else {
+        return;
+    };
+    let car_true = origin.to_true(car_transform.translation);
+    let dx = place.true_x - car_true.x;
+    let dz = place.true_z - car_true.z;
+    if (dx * dx + dz * dz).sqrt() > MAX_PLACEMENT_DISTANCE {
+        warn!("economy: rejected placement — too far from the sender's own car");
+        return;
+    }
+
+    if place.kind.requires_deposit() && !is_near_deposit(place.true_x, place.true_z) {
+        warn!("economy: rejected {:?} placement — not on a deposit", place.kind);
+        return;
+    }
+
+    let (cost_energy, cost_ore) = place.kind.cost();
+    let (energy, ore) = wallets.get_or_seed(player_id);
+    if energy < cost_energy || ore < cost_ore {
+        warn!("economy: rejected {:?} placement — insufficient funds", place.kind);
+        return;
+    }
+
+    let new_wallet = (energy - cost_energy, ore - cost_ore);
+    wallets.0.insert(player_id, new_wallet);
+    persistence.send(PersistenceCommand::SaveWallet(WalletRow {
+        player_id,
+        energy: new_wallet.0 as f64,
+        ore: new_wallet.1 as f64,
+    }));
+
+    let building_id = Uuid::new_v4();
+    let build_complete_at = now_unix() + place.kind.build_time_secs() as f64;
+    commands.spawn((
+        BuildingSnapshot {
+            kind: place.kind,
+            owner_player_id: player_id,
+            true_x: place.true_x,
+            true_z: place.true_z,
+            build_complete_at,
+        },
+        Replicated,
+    ));
+    persistence.send(PersistenceCommand::SaveBuilding(BuildingRow {
+        id: building_id,
+        owner_player_id: player_id,
+        kind: place.kind.as_db_str().to_string(),
+        true_x: place.true_x,
+        true_z: place.true_z,
+        build_complete_at: Some(build_complete_at),
+    }));
+}
+
+/// Teleports the sender's own car to their own completed Hangar — the
+/// simplified v1 Hangar behavior (see the base-building plan's scope
+/// note). Same reset mechanics `car_sim.rs`'s `apply_car_reset` uses
+/// (position/velocity/force reset, `reset_generation` bump), just anchored
+/// at a chosen point instead of "wherever the client's local reset already
+/// searched from."
+fn apply_recall_to_hangar(
+    _recall: On<FromClient<RecallToHangarMsg>>,
+    identities: Res<PlayerIdentities>,
+    noise: Res<TerrainNoise>,
+    origin: Res<WorldOrigin>,
+    buildings: Query<&BuildingSnapshot>,
+    mut cars: Query<(&OwnedBy, &mut Transform, &mut Velocity, &mut ExternalForce, &mut CarSnapshot)>,
+) {
+    let Some(client_entity) = _recall.client_id.entity() else {
+        return;
+    };
+    let Some(player_id) = identities.get(client_entity) else {
+        return;
+    };
+
+    let Some(hangar) = buildings.iter().find(|b| {
+        b.kind == BuildingKind::Hangar && b.owner_player_id == player_id && b.build_complete_at <= now_unix()
+    }) else {
+        return;
+    };
+
+    let ground_y = height_at(&noise, hangar.true_x, hangar.true_z);
+    let local = (bevy::math::DVec3::new(hangar.true_x, 0.0, hangar.true_z) - origin.offset).as_vec3();
+
+    for (owner, mut transform, mut velocity, mut ext_force, mut snapshot) in &mut cars {
+        if owner.0 != client_entity {
+            continue;
+        }
+        transform.translation = Vec3::new(local.x, ground_y + 2.0, local.z);
+        transform.rotation = Quat::IDENTITY;
+        *velocity = Velocity::zero();
+        *ext_force = ExternalForce::default();
+        snapshot.reset_generation = snapshot.reset_generation.wrapping_add(1);
+        break;
+    }
+
+}
+
+/// Credits every completed building's owner at `PRODUCTION_TICK_SECS`
+/// intervals — deliberately not every physics tick, since economy pacing
+/// has no reason to run at 64Hz. Saves a wallet through `persistence.rs`
+/// only when it actually changed this tick (i.e. at least one completed
+/// building produced something), not unconditionally every second.
+fn tick_production(
+    time: Res<Time>,
+    mut timer: ResMut<ProductionTimer>,
+    mut wallets: ResMut<Wallets>,
+    persistence: Res<Persistence>,
+    buildings: Query<&BuildingSnapshot>,
+) {
+    if !timer.0.tick(time.delta()).just_finished() {
+        return;
+    }
+    let now = now_unix();
+    let dt = PRODUCTION_TICK_SECS;
+
+    let mut changed: Vec<Uuid> = Vec::new();
+    for building in &buildings {
+        if building.build_complete_at > now {
+            continue; // still under construction
+        }
+        let (energy_rate, ore_rate) = building.kind.production_rate();
+        if energy_rate == 0.0 && ore_rate == 0.0 {
+            continue;
+        }
+        let entry = wallets.0.entry(building.owner_player_id).or_insert((STARTING_ENERGY, STARTING_ORE));
+        entry.0 += energy_rate * dt;
+        entry.1 += ore_rate * dt;
+        changed.push(building.owner_player_id);
+    }
+
+    for player_id in changed {
+        if let Some(&(energy, ore)) = wallets.0.get(&player_id) {
+            persistence.send(PersistenceCommand::SaveWallet(WalletRow {
+                player_id,
+                energy: energy as f64,
+                ore: ore as f64,
+            }));
+        }
+    }
+}

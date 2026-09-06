@@ -1,3 +1,4 @@
+use crate::chunk_rng::ChunkRng;
 use crate::terrain_gen::{slope_at, TerrainNoise, CHUNK_SIZE};
 
 /// Candidate placements tried per chunk — not all survive the slope check,
@@ -24,40 +25,6 @@ pub struct ObstacleSpec {
     pub true_z: f64,
     pub scale: f32,
     pub rotation_y: f32,
-}
-
-/// A small, fully deterministic PRNG seeded from chunk coordinates —
-/// avoids pulling `rand` into `shared` for just this, and (unlike `rand`'s
-/// own default algorithms, which don't promise cross-version stability)
-/// guarantees the exact same sequence forever, which matters here since
-/// the whole point is that client and server (and every other connected
-/// client) compute identical obstacle placements from nothing but a chunk
-/// coordinate — see `obstacles_for_chunk`'s docs.
-struct ChunkRng(u64);
-
-impl ChunkRng {
-    fn new(coord: (i64, i64), salt: u64) -> Self {
-        let x = coord.0 as u64;
-        let z = coord.1 as u64;
-        let mut h = x
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            ^ z.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
-            ^ salt;
-        // SplitMix64 finalizer, to avoid an all-zero or low-entropy seed
-        // from the xor above feeding straight into xorshift below.
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-        h ^= h >> 33;
-        Self(h | 1)
-    }
-
-    /// xorshift64, [0, 1).
-    fn next_f64(&mut self) -> f64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 >> 11) as f64 / (1u64 << 53) as f64
-    }
 }
 
 /// Deterministic obstacle placement for one terrain chunk — a pure function

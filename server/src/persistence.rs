@@ -20,8 +20,7 @@ pub struct PersistencePlugin;
 
 impl Plugin for PersistencePlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_persistence_thread)
-            .add_systems(Update, poll_persistence_results);
+        app.add_systems(Startup, spawn_persistence_thread);
     }
 }
 
@@ -83,6 +82,16 @@ impl Persistence {
     /// a database configured.
     pub fn send(&self, command: PersistenceCommand) {
         let _ = self.tx.send(command);
+    }
+
+    /// Drains one pending result from the persistence thread, if any —
+    /// callers (currently just `economy.rs`) poll this once per frame in
+    /// a loop until it returns `None`, applying `Loaded` into their own
+    /// in-memory state. `persistence.rs` itself has no opinion on what
+    /// that state is (wallets/buildings are Phase 2 concepts); it only
+    /// owns getting bytes to and from Postgres.
+    pub fn try_recv(&self) -> Option<PersistenceEvent> {
+        self.rx.lock().ok()?.try_recv().ok()
     }
 }
 
@@ -215,27 +224,4 @@ async fn load_all(pool: &PgPool) -> sqlx::Result<PersistenceEvent> {
     .fetch_all(pool)
     .await?;
     Ok(PersistenceEvent::Loaded { wallets, buildings })
-}
-
-/// Drains whatever the persistence thread has sent back. For now this just
-/// logs — Phase 2 will apply `Loaded` into the actual wallet/building ECS
-/// state once that exists.
-fn poll_persistence_results(persistence: Res<Persistence>) {
-    let Ok(rx) = persistence.rx.lock() else {
-        return;
-    };
-    while let Ok(event) = rx.try_recv() {
-        match event {
-            PersistenceEvent::Loaded { wallets, buildings } => {
-                info!(
-                    "persistence: loaded {} wallet(s), {} building(s)",
-                    wallets.len(),
-                    buildings.len()
-                );
-            }
-            PersistenceEvent::Unavailable => {
-                warn!("persistence: running without a database — nothing will persist");
-            }
-        }
-    }
 }

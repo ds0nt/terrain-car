@@ -3,6 +3,7 @@ use bevy_replicon::prelude::*;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::buildings::BuildingKind;
 use crate::car_physics::CarChassis;
 use crate::combat::Health;
 
@@ -216,6 +217,46 @@ pub struct LightningStrikeMsg {
     pub radius: f32,
 }
 
+/// Sent client -> server to place a building. `true_x`/`true_z` is where
+/// the player wants it (their car's current position — see client's
+/// `building_ui.rs`); the server is the sole authority on whether it's
+/// actually affordable and legally placed (funds, and for
+/// `ExtractionFacility`, proximity to a deposit — see
+/// `shared::deposits::is_near_deposit`), same trust boundary every other
+/// client -> server message in this game already enforces.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct PlaceBuildingMsg {
+    pub kind: BuildingKind,
+    pub true_x: f64,
+    pub true_z: f64,
+}
+
+/// Replicated per placed building — every client sees every player's
+/// buildings, not just their own. `build_complete_at` is a real Unix-epoch
+/// timestamp (seconds, matching `server::persistence`'s own choice of
+/// representation and this project's existing wall-clock-time precedent —
+/// see `shared::terrain_gen::random_seed`), not an elapsed-time-since-
+/// startup value: client and server otherwise have no shared time origin
+/// to compare against, since they don't start their processes at the same
+/// moment. A client considers a building still under construction while
+/// its own current Unix time is earlier than this.
+#[derive(Component, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct BuildingSnapshot {
+    pub kind: BuildingKind,
+    pub owner_player_id: Uuid,
+    pub true_x: f64,
+    pub true_z: f64,
+    pub build_complete_at: f64,
+}
+
+/// Sent client -> server: teleport the sender's own car to their Hangar —
+/// the simplified v1 Hangar behavior (see the base-building plan's scope
+/// note on why this isn't a multi-car garage yet). No payload: like
+/// `RegenRequestMsg`, the server already knows both who's asking and,
+/// once it looks up their `Hangar`, where "their Hangar" actually is.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct RecallToHangarMsg;
+
 /// Registers everything that must be identical between client and server:
 /// which components replicate (and how often), and the client -> server /
 /// server -> client event channels. Both binaries call this exact function
@@ -239,6 +280,9 @@ pub fn register_protocol(app: &mut App) {
         .add_server_event::<GunFiredMsg>(Channel::Unreliable)
         .add_client_event::<TuneCarMsg>(Channel::Ordered)
         .add_client_event::<IdentifyMsg>(Channel::Ordered)
+        .replicate::<BuildingSnapshot>()
+        .add_client_event::<PlaceBuildingMsg>(Channel::Ordered)
+        .add_client_event::<RecallToHangarMsg>(Channel::Ordered)
         .add_server_event::<WorldRegenMsg>(Channel::Ordered)
         // Unreliable: purely cosmetic, and another strike is at most 10s
         // away anyway, so a dropped one is never worth retransmitting.

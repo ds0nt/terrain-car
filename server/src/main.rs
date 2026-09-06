@@ -1,5 +1,6 @@
 mod car_sim;
 mod console;
+mod economy;
 mod lightning;
 mod net;
 mod persistence;
@@ -55,6 +56,7 @@ fn main() {
         console::ConsolePlugin,
         lightning::LightningPlugin,
         weapons::WeaponsPlugin,
+        economy::EconomyPlugin,
     ));
 
     // Registers replicated components/events — must use the exact same

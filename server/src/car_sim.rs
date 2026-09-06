@@ -111,6 +111,10 @@ impl PlayerRegistry {
 pub struct PlayerIdentities(HashMap<Entity, Uuid>);
 
 impl PlayerIdentities {
+    pub fn get(&self, client_entity: Entity) -> Option<Uuid> {
+        self.0.get(&client_entity).copied()
+    }
+
     fn remove(&mut self, client_entity: Entity) {
         self.0.remove(&client_entity);
     }

@@ -1,5 +1,8 @@
+pub mod buildings;
 pub mod car_physics;
+mod chunk_rng;
 pub mod combat;
+pub mod deposits;
 pub mod obstacles;
 pub mod protocol;
 pub mod terrain_gen;
