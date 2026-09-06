@@ -1,10 +1,10 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use bevy::math::DVec3;
 use bevy::prelude::*;
-use shared::buildings::BuildingKind;
+use bevy_rapier3d::prelude::{Collider, Friction, RigidBody};
+use shared::buildings::{self, BuildingKind};
 use shared::protocol::BuildingSnapshot;
 use shared::terrain_gen::{height_at, TerrainNoise};
+use shared::time::now_unix;
 
 use crate::worldspace::WorldOrigin;
 
@@ -23,13 +23,6 @@ impl Plugin for BuildingRenderPlugin {
     }
 }
 
-fn now_unix() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is set before the Unix epoch")
-        .as_secs_f64()
-}
-
 fn init_building_visuals(
     insert: On<Insert, BuildingSnapshot>,
     mut commands: Commands,
@@ -45,6 +38,37 @@ fn init_building_visuals(
     let ground_y = height_at(&noise, snapshot.true_x, snapshot.true_z);
     let local = (DVec3::new(snapshot.true_x, 0.0, snapshot.true_z) - origin.offset).as_vec3();
 
+    // Ramp is a real physics object (a car needs to drive on it), so it
+    // gets its own transform/collider path via the exact same pure
+    // `ramp_transform` function the server uses for its own collider —
+    // client and server can never disagree about where the surface is.
+    // Every other kind here is purely decorative (no collider at all).
+    if snapshot.kind == BuildingKind::Ramp {
+        let (translation, rotation) =
+            buildings::ramp_transform(local.x, local.z, ground_y, snapshot.rotation_y);
+        commands.entity(insert.entity).insert((
+            Mesh3d(meshes.add(Cuboid::new(
+                buildings::RAMP_HALF_WIDTH * 2.0,
+                buildings::RAMP_HALF_THICKNESS * 2.0,
+                buildings::RAMP_HALF_LENGTH * 2.0,
+            ))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgb(0.5, 0.45, 0.4),
+                perceptual_roughness: 0.8,
+                ..default()
+            })),
+            Transform::from_translation(translation).with_rotation(rotation),
+            RigidBody::Fixed,
+            Collider::cuboid(
+                buildings::RAMP_HALF_WIDTH,
+                buildings::RAMP_HALF_THICKNESS,
+                buildings::RAMP_HALF_LENGTH,
+            ),
+            Friction::coefficient(1.0),
+        ));
+        return;
+    }
+
     let (mesh, base_color, half_height) = match snapshot.kind {
         BuildingKind::Hangar => {
             (meshes.add(Cuboid::new(4.0, 2.5, 5.0)), Color::srgb(0.45, 0.45, 0.5), 1.25)
@@ -55,6 +79,10 @@ fn init_building_visuals(
         BuildingKind::ExtractionFacility => {
             (meshes.add(Cylinder::new(0.8, 4.0)), Color::srgb(0.75, 0.4, 0.2), 2.0)
         }
+        BuildingKind::LandFactory => {
+            (meshes.add(Cuboid::new(6.0, 3.5, 6.0)), Color::srgb(0.3, 0.35, 0.32), 1.75)
+        }
+        BuildingKind::Ramp => unreachable!("handled above"),
     };
 
     commands.entity(insert.entity).insert((
@@ -64,7 +92,8 @@ fn init_building_visuals(
             alpha_mode: AlphaMode::Blend,
             ..default()
         })),
-        Transform::from_xyz(local.x, ground_y + half_height, local.z),
+        Transform::from_xyz(local.x, ground_y + half_height, local.z)
+            .with_rotation(Quat::from_rotation_y(snapshot.rotation_y)),
     ));
 }
 

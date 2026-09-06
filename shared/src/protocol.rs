@@ -112,6 +112,19 @@ pub struct CarSnapshot {
     pub reset_generation: u32,
 }
 
+/// Sent client -> server when the player presses R to right a flipped car
+/// — deliberately separate from `CarResetMsg` (world-regen's "find me
+/// flat ground somewhere near here" reset): R no longer searches for
+/// anywhere else to go, it just corrects orientation and drops the car
+/// back onto the ground at its *own current* position. Carries that exact
+/// point (true-space) so the server independently recomputes the same
+/// ground height rather than trusting a client-supplied Y.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct FlipUprightMsg {
+    pub true_x: f64,
+    pub true_z: f64,
+}
+
 /// Sent client -> server when the player presses N, requesting a full world
 /// regeneration (new terrain seed). Only takes effect if the server
 /// independently confirms the sender holds op privileges — never trust
@@ -259,6 +272,11 @@ pub struct PlaceBuildingMsg {
     pub kind: BuildingKind,
     pub true_x: f64,
     pub true_z: f64,
+    /// The placing car's own yaw at the moment of placement — mainly
+    /// meaningful for `Ramp` (which way it faces determines which way you
+    /// drive up it), but carried for every kind so a future kind can use
+    /// it too without another protocol change.
+    pub rotation_y: f32,
 }
 
 /// Replicated per placed building — every client sees every player's
@@ -277,6 +295,7 @@ pub struct BuildingSnapshot {
     pub true_x: f64,
     pub true_z: f64,
     pub build_complete_at: f64,
+    pub rotation_y: f32,
 }
 
 /// Sent client -> server: teleport the sender's own car to their Hangar —
@@ -305,6 +324,7 @@ pub fn register_protocol(app: &mut App) {
         .replicate::<Health>()
         .add_client_event::<CarInputMsg>(Channel::Unreliable)
         .add_client_event::<CarResetMsg>(Channel::Ordered)
+        .add_client_event::<FlipUprightMsg>(Channel::Ordered)
         .add_client_event::<RegenRequestMsg>(Channel::Ordered)
         .add_client_event::<FireGunMsg>(Channel::Unreliable)
         .add_server_event::<GunFiredMsg>(Channel::Unreliable)

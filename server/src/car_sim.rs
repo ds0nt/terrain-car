@@ -11,8 +11,8 @@ use shared::car_physics::{
 };
 use shared::combat::{Health, DEFAULT_MAX_HEALTH};
 use shared::protocol::{
-    spawn_car_signature, CarInputMsg, CarResetMsg, CarSnapshot, IdentifyMsg, RegenRequestMsg,
-    TuneCarMsg, Wallet, WorldRegenMsg,
+    spawn_car_signature, CarInputMsg, CarResetMsg, CarSnapshot, FlipUprightMsg, IdentifyMsg,
+    RegenRequestMsg, TuneCarMsg, Wallet, WorldRegenMsg,
 };
 use uuid::Uuid;
 use shared::terrain_gen::{find_flat_spawn, height_at, random_seed, TerrainNoise};
@@ -56,6 +56,7 @@ impl Plugin for CarSimPlugin {
             .add_observer(despawn_car_on_disconnect)
             .add_observer(apply_car_input)
             .add_observer(apply_car_reset)
+            .add_observer(apply_flip_upright)
             .add_observer(apply_car_tune)
             .add_observer(apply_identify)
             .add_observer(apply_world_regen_request)
@@ -379,6 +380,39 @@ fn apply_car_reset(
         let local_spawn = (spawn_true - origin.offset).as_vec3();
 
         transform.translation = Vec3::new(local_spawn.x, ground_y + 2.0, local_spawn.z);
+        transform.rotation = Quat::IDENTITY;
+        *velocity = Velocity::zero();
+        *ext_force = ExternalForce::default();
+        snapshot.reset_generation = snapshot.reset_generation.wrapping_add(1);
+        break;
+    }
+}
+
+/// Authoritative half of R's "right the car in place" — see client's
+/// `flip_car_upright` docs for why this is a separate message/handler
+/// from `apply_car_reset` rather than reusing it: no search, just
+/// recompute ground height at the exact point the client gave (its own
+/// current position) and correct orientation there.
+fn apply_flip_upright(
+    flip_msg: On<FromClient<FlipUprightMsg>>,
+    noise: Res<TerrainNoise>,
+    mut cars: Query<(
+        &OwnedBy,
+        &mut Transform,
+        &mut Velocity,
+        &mut ExternalForce,
+        &mut CarSnapshot,
+    )>,
+) {
+    let Some(client_entity) = flip_msg.client_id.entity() else {
+        return;
+    };
+    for (owner, mut transform, mut velocity, mut ext_force, mut snapshot) in &mut cars {
+        if owner.0 != client_entity {
+            continue;
+        }
+        let ground_y = height_at(&noise, flip_msg.true_x, flip_msg.true_z);
+        transform.translation.y = ground_y + 2.0;
         transform.rotation = Quat::IDENTITY;
         *velocity = Velocity::zero();
         *ext_force = ExternalForce::default();

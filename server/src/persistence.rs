@@ -39,29 +39,21 @@ pub struct BuildingRow {
     pub true_x: f64,
     pub true_z: f64,
     pub build_complete_at: Option<f64>,
+    pub rotation_y: f64,
 }
 
 /// Sent from Bevy systems to the persistence thread. Saves are
 /// fire-and-forget from the caller's perspective — a failed save just logs
 /// a warning on the thread and gets superseded by the next periodic save,
 /// never propagates an error back into the game loop.
-///
-/// `SaveWallet`/`SaveBuilding`/`LoadAll` aren't sent by anything yet — this
-/// phase is the persistence plumbing itself (connect, migrate, round-trip
-/// a player upsert); real wallet/building state to save doesn't exist
-/// until the base-building plan's Phase 2. Allowing dead_code deliberately
-/// rather than deleting and re-adding the same API next phase.
-#[allow(dead_code)]
 pub enum PersistenceCommand {
     UpsertPlayer(Uuid),
     SaveWallet(WalletRow),
     SaveBuilding(BuildingRow),
-    LoadAll,
 }
 
-/// Sent back from the persistence thread once a `LoadAll` completes —
-/// applied once by `poll_persistence_results` (in practice, once at
-/// startup; nothing else currently issues `LoadAll`).
+/// Sent back from the persistence thread once loaded — currently only
+/// happens once, right after connecting/migrating at startup.
 pub enum PersistenceEvent {
     Loaded { wallets: Vec<WalletRow>, buildings: Vec<BuildingRow> },
     Unavailable,
@@ -163,11 +155,6 @@ fn run_persistence_thread(
                         warn!("persistence: failed to save building {}: {e}", building.id);
                     }
                 }
-                PersistenceCommand::LoadAll => {
-                    if let Ok(loaded) = load_all(&pool).await {
-                        let _ = event_tx.send(loaded);
-                    }
-                }
             }
         }
     });
@@ -199,8 +186,8 @@ async fn save_wallet(pool: &PgPool, wallet: &WalletRow) -> sqlx::Result<()> {
 
 async fn save_building(pool: &PgPool, building: &BuildingRow) -> sqlx::Result<()> {
     sqlx::query(
-        "insert into buildings (id, owner_player_id, kind, true_x, true_z, build_complete_at) \
-         values ($1, $2, $3, $4, $5, $6) \
+        "insert into buildings (id, owner_player_id, kind, true_x, true_z, build_complete_at, rotation_y) \
+         values ($1, $2, $3, $4, $5, $6, $7) \
          on conflict (id) do update set build_complete_at = excluded.build_complete_at",
     )
     .bind(building.id)
@@ -209,6 +196,7 @@ async fn save_building(pool: &PgPool, building: &BuildingRow) -> sqlx::Result<()
     .bind(building.true_x)
     .bind(building.true_z)
     .bind(building.build_complete_at)
+    .bind(building.rotation_y)
     .execute(pool)
     .await?;
     Ok(())
@@ -219,7 +207,7 @@ async fn load_all(pool: &PgPool) -> sqlx::Result<PersistenceEvent> {
         .fetch_all(pool)
         .await?;
     let buildings = sqlx::query_as::<_, BuildingRow>(
-        "select id, owner_player_id, kind, true_x, true_z, build_complete_at from buildings",
+        "select id, owner_player_id, kind, true_x, true_z, build_complete_at, rotation_y from buildings",
     )
     .fetch_all(pool)
     .await?;

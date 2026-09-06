@@ -4,8 +4,10 @@ use bevy_replicon::prelude::*;
 use rand::Rng;
 use uuid::Uuid;
 
+use shared::buildings::BuildingKind;
 use shared::deposits::is_near_deposit;
-use shared::protocol::{IdentifyMsg, VillagerSnapshot};
+use shared::protocol::{BuildingSnapshot, IdentifyMsg, VillagerSnapshot};
+use shared::time::now_unix;
 use shared::worldspace::WorldOrigin;
 
 use crate::car_sim::{OwnedBy, PlayerIdentities};
@@ -27,8 +29,12 @@ impl Plugin for VillagersPlugin {
             GATHER_TICK_SECS,
             TimerMode::Repeating,
         )))
+        .insert_resource(LandFactoryTimer(Timer::from_seconds(
+            LAND_FACTORY_INTERVAL_SECS,
+            TimerMode::Repeating,
+        )))
         .add_observer(spawn_villager_on_identify)
-        .add_systems(Update, (wander_villagers, gather_resources));
+        .add_systems(Update, (wander_villagers, gather_resources, spawn_from_land_factories));
     }
 }
 
@@ -41,6 +47,12 @@ const GATHER_TICK_SECS: f32 = 1.0;
 /// against being stuck at zero, not a replacement for actually building.
 const ORE_GATHER_RATE: f32 = 0.3;
 const ENERGY_GATHER_RATE: f32 = 0.3;
+/// How often each completed Land Factory produces one more villager for
+/// its owner.
+const LAND_FACTORY_INTERVAL_SECS: f32 = 60.0;
+/// Caps runaway villager growth — a slow economy-multiplier building, not
+/// an unbounded one.
+const MAX_VILLAGERS_PER_PLAYER: usize = 5;
 
 #[derive(Component)]
 struct VillagerAi {
@@ -52,6 +64,22 @@ struct VillagerAi {
 
 #[derive(Resource)]
 struct GatherTimer(Timer);
+
+#[derive(Resource)]
+struct LandFactoryTimer(Timer);
+
+fn spawn_villager(commands: &mut Commands, owner_player_id: Uuid, true_x: f64, true_z: f64) {
+    commands.spawn((
+        VillagerAi {
+            owner_player_id,
+            target_true_x: true_x,
+            target_true_z: true_z,
+            retarget_timer: 0.0,
+        },
+        VillagerSnapshot { owner_player_id, true_x, true_z },
+        Replicated,
+    ));
+}
 
 /// Spawns exactly one villager per player, the first time they're
 /// identified. Idempotent by checking for an existing `VillagerAi` with
@@ -75,21 +103,37 @@ fn spawn_villager_on_identify(
         return;
     };
     let true_pos = origin.to_true(car_transform.translation);
+    spawn_villager(&mut commands, identify.player_id, true_pos.x, true_pos.z);
+}
 
-    commands.spawn((
-        VillagerAi {
-            owner_player_id: identify.player_id,
-            target_true_x: true_pos.x,
-            target_true_z: true_pos.z,
-            retarget_timer: 0.0,
-        },
-        VillagerSnapshot {
-            owner_player_id: identify.player_id,
-            true_x: true_pos.x,
-            true_z: true_pos.z,
-        },
-        Replicated,
-    ));
+/// Every `LAND_FACTORY_INTERVAL_SECS`, each completed Land Factory spawns
+/// one more villager for its owner — see `BuildingKind::LandFactory`'s v1
+/// scope note (this is the only part of "a factory for villagers, tanks,
+/// and AA tanks" actually implemented so far; tanks/AA tanks are a real
+/// unit/combat-AI system deserving their own pass). Capped per player so
+/// this is a slow multiplier, not unbounded growth.
+fn spawn_from_land_factories(
+    time: Res<Time>,
+    mut timer: ResMut<LandFactoryTimer>,
+    mut commands: Commands,
+    buildings: Query<&BuildingSnapshot>,
+    villagers: Query<&VillagerAi>,
+) {
+    if !timer.0.tick(time.delta()).just_finished() {
+        return;
+    }
+    let now = now_unix();
+    for building in &buildings {
+        if building.kind != BuildingKind::LandFactory || building.build_complete_at > now {
+            continue;
+        }
+        let count =
+            villagers.iter().filter(|v| v.owner_player_id == building.owner_player_id).count();
+        if count >= MAX_VILLAGERS_PER_PLAYER {
+            continue;
+        }
+        spawn_villager(&mut commands, building.owner_player_id, building.true_x, building.true_z);
+    }
 }
 
 fn wander_villagers(

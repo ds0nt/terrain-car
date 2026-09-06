@@ -41,8 +41,13 @@ fn send_recall_input(keyboard: Res<ButtonInput<KeyCode>>, mut commands: Commands
     }
 }
 
-const BUILDING_KINDS: [BuildingKind; 3] =
-    [BuildingKind::Hangar, BuildingKind::EnergyGenerator, BuildingKind::ExtractionFacility];
+const BUILDING_KINDS: [BuildingKind; 5] = [
+    BuildingKind::Hangar,
+    BuildingKind::EnergyGenerator,
+    BuildingKind::ExtractionFacility,
+    BuildingKind::Ramp,
+    BuildingKind::LandFactory,
+];
 
 fn draw_build_menu(
     mut contexts: EguiContexts,
@@ -58,6 +63,9 @@ fn draw_build_menu(
         return Ok(());
     };
     let true_pos = origin.to_true(transform.translation);
+    // Captured so a Ramp faces the way the car was pointed at placement —
+    // see PlaceBuildingMsg's docs; every other kind ignores this.
+    let (rotation_y, _, _) = transform.rotation.to_euler(EulerRot::YXZ);
 
     egui::Window::new("Build (B to close)").show(contexts.ctx_mut()?, |ui| {
         ui.label(format!("Energy: {:.0}   Ore: {:.0}", wallet.energy, wallet.ore));
@@ -75,6 +83,7 @@ fn draw_build_menu(
                         kind,
                         true_x: true_pos.x,
                         true_z: true_pos.z,
+                        rotation_y,
                     });
                 }
             });

@@ -23,7 +23,7 @@ impl Plugin for CarPlugin {
         app.init_resource::<CarInput>()
             .add_message::<CarResetEvent>()
             .add_systems(Startup, spawn_car)
-            .add_systems(Update, (read_car_input, reset_car).chain())
+            .add_systems(Update, (read_car_input, flip_car_upright, reset_car_after_regen).chain())
             // Physics lives in FixedUpdate (alongside Rapier itself, see
             // main.rs's `in_fixed_schedule()`) rather than Update, so the
             // suspension/drive step advances by a constant dt regardless of
@@ -131,13 +131,51 @@ fn spawn_car(
     ));
 }
 
-/// R: snap the car back to (local) spawn, upright and stationary — for when
-/// it ends up flipped, buried in a mountain, or off in a ravine somewhere.
-/// Also fires on a RegenerateWorldEvent (N, see terrain.rs), which resets
-/// WorldOrigin to zero first, so "local spawn" and "true spawn" coincide
-/// again right after a regenerate.
-fn reset_car(
+/// R: right the car exactly where it already is — corrects orientation and
+/// drops it back onto the ground at its *own current* x/z, no search, no
+/// teleport. Used to search for flat ground somewhere nearby instead (the
+/// old "unstick me" behavior); changed because a flip on a hillside
+/// shouldn't relocate you to wherever the nearest flat patch happened to
+/// be — you just want to be back on your wheels where you already were.
+fn flip_car_upright(
     keyboard: Res<ButtonInput<KeyCode>>,
+    noise: Res<TerrainNoise>,
+    origin: Res<WorldOrigin>,
+    mut chassis_q: Query<(&mut Transform, &mut Velocity, &mut ExternalForce), With<LocalCar>>,
+    mut reset_events: MessageWriter<CarResetEvent>,
+    mut commands: Commands,
+    mut local_reset: ResMut<crate::prediction::LocalResetGeneration>,
+) {
+    if !keyboard.just_pressed(KeyCode::KeyR) {
+        return;
+    }
+    let Ok((mut transform, mut velocity, mut ext_force)) = chassis_q.single_mut() else {
+        return;
+    };
+
+    let true_pos = origin.to_true(transform.translation);
+    let ground_y = height_at(&noise, true_pos.x, true_pos.z);
+    transform.translation.y = ground_y + 2.0;
+    transform.rotation = Quat::IDENTITY;
+    *velocity = Velocity::zero();
+    *ext_force = ExternalForce::default();
+    reset_events.write(CarResetEvent);
+
+    // Tell the server to right this car too — same reasoning CarResetMsg's
+    // docs give: without this, the server's still-in-flight pre-flip
+    // snapshot would look like a real desync and reconciliation would yank
+    // the car back toward its old (flipped) orientation/position.
+    commands.client_trigger(shared::protocol::FlipUprightMsg {
+        true_x: true_pos.x,
+        true_z: true_pos.z,
+    });
+    local_reset.0 = local_reset.0.wrapping_add(1);
+}
+
+/// Handles a `RegenerateWorldEvent` (N, see terrain.rs): the old position
+/// is meaningless after a regen (new terrain, WorldOrigin reset to zero),
+/// so unlike R this still searches for a genuinely new flat spawn.
+fn reset_car_after_regen(
     noise: Res<TerrainNoise>,
     origin: Res<WorldOrigin>,
     mut regenerated: MessageReader<RegenerateWorldEvent>,
@@ -146,18 +184,12 @@ fn reset_car(
     mut commands: Commands,
     mut local_reset: ResMut<crate::prediction::LocalResetGeneration>,
 ) {
-    let was_regenerated = regenerated.read().next().is_some();
-    if !keyboard.just_pressed(KeyCode::KeyR) && !was_regenerated {
+    if regenerated.read().next().is_none() {
         return;
     }
     let Ok((mut transform, mut velocity, mut ext_force)) = chassis_q.single_mut() else {
         return;
     };
-    // Reset near the *current* local origin, not literally true (0,0,0) —
-    // if the world has rebased since spawn, that's thousands of meters of
-    // driving away, and "unstick me" should mean "near where I am now."
-    // Search for flat ground around it rather than trusting that exact
-    // point isn't a cliff.
     let spawn_true = find_flat_spawn(&noise, origin.offset, SPAWN_SEARCH_RADIUS);
     let ground_y = height_at(&noise, spawn_true.x, spawn_true.z);
     let local_spawn = (spawn_true - origin.offset).as_vec3();
@@ -167,13 +199,6 @@ fn reset_car(
     *ext_force = ExternalForce::default();
     reset_events.write(CarResetEvent);
 
-    // Tell the server to reset this car too (same search point, so it
-    // independently finds the same flat ground — see CarResetMsg's docs),
-    // and remember we did this locally so reconcile_with_server doesn't
-    // treat the server's still-in-flight pre-reset snapshot as a real
-    // desync and yank the car back. Without this, R would fight the
-    // server's reconciliation and produce exactly the "weird" teleporting
-    // back toward the old position that this fixes.
     commands.client_trigger(shared::protocol::CarResetMsg {
         near_true_x: origin.offset.x,
         near_true_z: origin.offset.z,

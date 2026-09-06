@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use shared::time::now_unix;
 
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
@@ -43,13 +43,6 @@ impl Plugin for EconomyPlugin {
     }
 }
 
-fn now_unix() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is set before the Unix epoch")
-        .as_secs_f64()
-}
-
 /// Server-authoritative in-memory wallets, keyed by the durable
 /// `PersistentPlayerId` (not `Entity` — a wallet must outlive any single
 /// connection). Postgres (`persistence.rs`) is a write-behind mirror of
@@ -72,12 +65,6 @@ impl Wallets {
         self.0.get(&player_id).copied()
     }
 
-    /// Moves up to `amount` ore from `from`'s wallet to `to`'s, capped by
-    /// how much `from` actually has (never goes negative). Used by the
-    /// gun's on-hit ore steal (`weapons.rs`) — a deliberate PvP tie-in
-    /// between combat and the economy, not accidental scope creep: shoot
-    /// another player, take a cut of their ore. Returns the amount
-    /// actually transferred (0 if `from` had none).
     /// Adds (or subtracts, for a negative delta) to a player's balance
     /// directly — used by passive income sources (villagers' gathering,
     /// `villagers.rs`) that aren't a transfer between two players the way
@@ -87,6 +74,12 @@ impl Wallets {
         self.0.insert(player_id, (energy + energy_delta, ore + ore_delta));
     }
 
+    /// Moves up to `amount` ore from `from`'s wallet to `to`'s, capped by
+    /// how much `from` actually has (never goes negative). Used by the
+    /// gun's on-hit ore steal (`weapons.rs`) — a deliberate PvP tie-in
+    /// between combat and the economy, not accidental scope creep: shoot
+    /// another player, take a cut of their ore. Returns the amount
+    /// actually transferred (0 if `from` had none).
     pub fn steal_ore(&mut self, from: Uuid, to: Uuid, amount: f32) -> f32 {
         // get_or_seed returns a copy, not a live reference — mutate via
         // insert(), same read-compute-write-back shape every other wallet
@@ -136,6 +129,8 @@ fn apply_loaded_state(
     mut commands: Commands,
     persistence: Res<Persistence>,
     mut wallets: ResMut<Wallets>,
+    noise: Res<TerrainNoise>,
+    origin: Res<WorldOrigin>,
 ) {
     while let Some(event) = persistence.try_recv() {
         match event {
@@ -144,7 +139,7 @@ fn apply_loaded_state(
                     wallets.0.insert(wallet.player_id, (wallet.energy as f32, wallet.ore as f32));
                 }
                 for building in buildings {
-                    spawn_building_from_row(&mut commands, &building);
+                    spawn_building_from_row(&mut commands, &noise, &origin, &building);
                 }
                 info!(
                     "economy: applied {} loaded wallet(s)",
@@ -158,21 +153,72 @@ fn apply_loaded_state(
     }
 }
 
-fn spawn_building_from_row(commands: &mut Commands, row: &BuildingRow) {
+/// Spawns a `BuildingSnapshot` and, for a drivable structure (`Ramp`), the
+/// matching physics collider too — server-side collision must exist for
+/// any kind a car can actually drive on, or the server's own authoritative
+/// physics would let a car fall straight through it while the client's
+/// local prediction (which does have the collider — see client's
+/// `building_render.rs`) disagrees, fighting reconciliation constantly.
+/// Uses `shared::buildings::ramp_transform` — the exact same pure function
+/// the client calls for its visual mesh — so the two can never disagree
+/// about where the surface actually is.
+fn spawn_building(
+    commands: &mut Commands,
+    noise: &TerrainNoise,
+    origin: &WorldOrigin,
+    kind: BuildingKind,
+    owner_player_id: Uuid,
+    true_x: f64,
+    true_z: f64,
+    build_complete_at: f64,
+    rotation_y: f32,
+) -> Entity {
+    let mut entity = commands.spawn((
+        BuildingSnapshot { kind, owner_player_id, true_x, true_z, build_complete_at, rotation_y },
+        Replicated,
+    ));
+
+    if kind.is_drivable_structure() {
+        let ground_y = height_at(noise, true_x, true_z);
+        let local = (bevy::math::DVec3::new(true_x, 0.0, true_z) - origin.offset).as_vec3();
+        let (translation, rotation) =
+            shared::buildings::ramp_transform(local.x, local.z, ground_y, rotation_y);
+        entity.insert((
+            Transform::from_translation(translation).with_rotation(rotation),
+            RigidBody::Fixed,
+            Collider::cuboid(
+                shared::buildings::RAMP_HALF_WIDTH,
+                shared::buildings::RAMP_HALF_THICKNESS,
+                shared::buildings::RAMP_HALF_LENGTH,
+            ),
+            Friction::coefficient(1.0),
+        ));
+    }
+
+    entity.id()
+}
+
+fn spawn_building_from_row(
+    commands: &mut Commands,
+    noise: &TerrainNoise,
+    origin: &WorldOrigin,
+    row: &BuildingRow,
+) {
     let Some(kind) = BuildingKind::from_db_str(&row.kind) else {
         warn!("economy: ignoring building {} with unknown kind `{}`", row.id, row.kind);
         return;
     };
-    commands.spawn((
-        BuildingSnapshot {
-            kind,
-            owner_player_id: row.owner_player_id,
-            true_x: row.true_x,
-            true_z: row.true_z,
-            build_complete_at: row.build_complete_at.unwrap_or(0.0),
-        },
-        Replicated,
-    ));
+    spawn_building(
+        commands,
+        noise,
+        origin,
+        kind,
+        row.owner_player_id,
+        row.true_x,
+        row.true_z,
+        row.build_complete_at.unwrap_or(0.0),
+        row.rotation_y as f32,
+    );
 }
 
 /// Resolves one `PlaceBuildingMsg`: validates the sender is identified,
@@ -182,10 +228,12 @@ fn spawn_building_from_row(commands: &mut Commands, row: &BuildingRow) {
 /// message in this game. On success, deducts the cost immediately and
 /// spawns a replicated `BuildingSnapshot` with `build_complete_at` in the
 /// future.
+#[allow(clippy::too_many_arguments)]
 fn apply_place_building(
     place: On<FromClient<PlaceBuildingMsg>>,
     identities: Res<PlayerIdentities>,
     origin: Res<WorldOrigin>,
+    noise: Res<TerrainNoise>,
     mut wallets: ResMut<Wallets>,
     persistence: Res<Persistence>,
     mut commands: Commands,
@@ -236,16 +284,17 @@ fn apply_place_building(
 
     let building_id = Uuid::new_v4();
     let build_complete_at = now_unix() + place.kind.build_time_secs() as f64;
-    commands.spawn((
-        BuildingSnapshot {
-            kind: place.kind,
-            owner_player_id: player_id,
-            true_x: place.true_x,
-            true_z: place.true_z,
-            build_complete_at,
-        },
-        Replicated,
-    ));
+    spawn_building(
+        &mut commands,
+        &noise,
+        &origin,
+        place.kind,
+        player_id,
+        place.true_x,
+        place.true_z,
+        build_complete_at,
+        place.rotation_y,
+    );
     persistence.send(PersistenceCommand::SaveBuilding(BuildingRow {
         id: building_id,
         owner_player_id: player_id,
@@ -253,6 +302,7 @@ fn apply_place_building(
         true_x: place.true_x,
         true_z: place.true_z,
         build_complete_at: Some(build_complete_at),
+        rotation_y: place.rotation_y as f64,
     }));
 }
 
