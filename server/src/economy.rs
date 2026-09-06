@@ -63,6 +63,34 @@ impl Wallets {
     fn get_or_seed(&mut self, player_id: Uuid) -> (f32, f32) {
         *self.0.entry(player_id).or_insert((STARTING_ENERGY, STARTING_ORE))
     }
+
+    /// Current balance for a player, if they've been seen before —
+    /// `pub` so callers outside this module (currently just `weapons.rs`,
+    /// reading a balance back to persist it after `steal_ore`) don't need
+    /// direct access to the private map.
+    pub fn get(&self, player_id: Uuid) -> Option<(f32, f32)> {
+        self.0.get(&player_id).copied()
+    }
+
+    /// Moves up to `amount` ore from `from`'s wallet to `to`'s, capped by
+    /// how much `from` actually has (never goes negative). Used by the
+    /// gun's on-hit ore steal (`weapons.rs`) — a deliberate PvP tie-in
+    /// between combat and the economy, not accidental scope creep: shoot
+    /// another player, take a cut of their ore. Returns the amount
+    /// actually transferred (0 if `from` had none).
+    pub fn steal_ore(&mut self, from: Uuid, to: Uuid, amount: f32) -> f32 {
+        // get_or_seed returns a copy, not a live reference — mutate via
+        // insert(), same read-compute-write-back shape every other wallet
+        // mutation in this file already uses (see apply_place_building).
+        let (from_energy, from_ore) = self.get_or_seed(from);
+        let transferred = from_ore.min(amount).max(0.0);
+        self.0.insert(from, (from_energy, from_ore - transferred));
+
+        let (to_energy, to_ore) = self.get_or_seed(to);
+        self.0.insert(to, (to_energy, to_ore + transferred));
+
+        transferred
+    }
 }
 
 #[derive(Resource)]
@@ -328,5 +356,56 @@ fn sync_wallet_components(
             wallet.energy = energy;
             wallet.ore = ore;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn steal_ore_moves_the_requested_amount() {
+        let mut wallets = Wallets::default();
+        let from = Uuid::new_v4();
+        let to = Uuid::new_v4();
+        wallets.get_or_seed(from); // seed both at STARTING_ORE
+        wallets.get_or_seed(to);
+
+        let transferred = wallets.steal_ore(from, to, 5.0);
+
+        assert_eq!(transferred, 5.0);
+        assert_eq!(wallets.get(from).unwrap().1, STARTING_ORE - 5.0);
+        assert_eq!(wallets.get(to).unwrap().1, STARTING_ORE + 5.0);
+    }
+
+    #[test]
+    fn steal_ore_caps_at_the_victims_actual_balance() {
+        let mut wallets = Wallets::default();
+        let from = Uuid::new_v4();
+        let to = Uuid::new_v4();
+        wallets.get_or_seed(from);
+
+        // Ask for far more than STARTING_ORE has.
+        let transferred = wallets.steal_ore(from, to, STARTING_ORE + 1000.0);
+
+        assert_eq!(transferred, STARTING_ORE);
+        assert_eq!(wallets.get(from).unwrap().1, 0.0);
+        assert_eq!(wallets.get(to).unwrap().1, STARTING_ORE + STARTING_ORE);
+    }
+
+    #[test]
+    fn steal_ore_never_makes_the_victim_go_negative() {
+        let mut wallets = Wallets::default();
+        let from = Uuid::new_v4();
+        let to = Uuid::new_v4();
+        wallets.get_or_seed(from);
+
+        wallets.steal_ore(from, to, STARTING_ORE + 1000.0);
+        // A second attempt against an already-empty wallet should
+        // transfer nothing, not go negative.
+        let second = wallets.steal_ore(from, to, 10.0);
+
+        assert_eq!(second, 0.0);
+        assert_eq!(wallets.get(from).unwrap().1, 0.0);
     }
 }
