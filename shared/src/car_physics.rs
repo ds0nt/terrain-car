@@ -89,7 +89,12 @@ pub const CAR_ANGULAR_DAMPING: f32 = 3.5;
 /// replicated `CarChassis` echo even arrives — a client running even
 /// slightly different numbers would mispredict every tick.
 pub fn default_chassis() -> CarChassis {
-    let half_extents = Vec3::new(0.9, 0.35, 1.9);
+    // Wider and shorter than before (was (0.9, 0.35, 1.9)) — a lower,
+    // wider box puts the mass centroid closer to the ground and takes
+    // more lateral-g to tip, without needing to touch wheel_mounts/
+    // suspension geometry at all (both derive from half_extents already,
+    // so they stay self-consistent automatically).
+    let half_extents = Vec3::new(1.0, 0.28, 1.9);
     CarChassis {
         half_extents,
         wheel_radius: 0.4,
@@ -105,9 +110,11 @@ pub fn default_chassis() -> CarChassis {
         // an insane top end.
         engine_force: 22_000.0,
         brake_force: 20_000.0,
-        // Lowered slightly from 12_000.0 — a touch less grip reads better
-        // on "insane terrain" than sticking dead to the surface.
-        traction: 10_000.0,
+        // Back up from a brief 10_000.0 experiment — that read as too
+        // loose/sliding once actually driven (see ROLLING_RESISTANCE_COEFF
+        // for the other, bigger half of that fix: this only ever affected
+        // lateral grip, not a coasting car's failure to ever slow down).
+        traction: 12_000.0,
         // Caller sets this to the actual player's connection id — this
         // placeholder only matters if something spawns a car without ever
         // overwriting it.
@@ -188,10 +195,25 @@ pub fn compute_wheel_forces(chassis: &CarChassis, input: &WheelStepInput) -> Whe
     let mut force = input.up * suspension_force;
     let mut torque = input.arm.cross(force);
 
+    let forward_speed = input.point_velocity.dot(input.wheel_forward);
+
     if input.throttle.abs() > f32::EPSILON {
         let drive_force = input.wheel_forward * (chassis.engine_force * 0.25 * input.throttle);
         force += drive_force;
         torque += input.arm.cross(drive_force);
+    } else if !input.brake {
+        // Rolling resistance: without this, releasing the throttle left
+        // nothing opposing forward motion except Rapier's generic
+        // `Damping` on the whole rigid body (velocity-proportional, not
+        // specifically a tire/road effect) — weak enough that a car let
+        // go at speed coasted for the better part of a minute instead of
+        // settling to a stop the way idling off the gas actually should.
+        // Deliberately much gentler than a real brake (~1/13th the
+        // coefficient), so it reads as "coasting to a stop," not
+        // "the brakes are always on a little."
+        let rolling_resistance = -input.wheel_forward * (forward_speed * chassis.brake_force * 0.00075);
+        force += rolling_resistance;
+        torque += input.arm.cross(rolling_resistance);
     }
 
     // Simplified lateral traction: a stiff velocity-proportional corrective
@@ -210,7 +232,6 @@ pub fn compute_wheel_forces(chassis: &CarChassis, input: &WheelStepInput) -> Whe
     force += traction_force;
     torque += input.arm.cross(traction_force);
 
-    let forward_speed = input.point_velocity.dot(input.wheel_forward);
     if input.brake {
         let brake_force = -input.wheel_forward * (forward_speed * chassis.brake_force * 0.01);
         force += brake_force;
