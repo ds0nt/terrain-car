@@ -68,9 +68,60 @@ pub fn is_near_deposit(true_x: f64, true_z: f64) -> bool {
     false
 }
 
+/// Finds the closest deposit to `(true_x, true_z)` within
+/// `search_radius_chunks` chunks in every direction — client's `hud.rs`
+/// uses this to tell the player roughly where to go, since otherwise a
+/// deposit's ~8%-of-chunks sparsity (and `is_near_deposit`'s tight 15m
+/// claim radius) would make finding one by blind driving unreasonably
+/// tedious. Deterministic and pure like everything else in this module, so
+/// it runs entirely client-side — no server round-trip needed to answer
+/// "where's the nearest ore."
+pub fn nearest_deposit_within(
+    true_x: f64,
+    true_z: f64,
+    search_radius_chunks: i64,
+) -> Option<DepositSpec> {
+    let (cx, cz) = world_to_chunk(DVec3::new(true_x, 0.0, true_z));
+    let mut best: Option<(f64, DepositSpec)> = None;
+    for dx in -search_radius_chunks..=search_radius_chunks {
+        for dz in -search_radius_chunks..=search_radius_chunks {
+            let Some(deposit) = deposit_for_chunk((cx + dx, cz + dz)) else {
+                continue;
+            };
+            let ddx = deposit.true_x - true_x;
+            let ddz = deposit.true_z - true_z;
+            let dist = (ddx * ddx + ddz * ddz).sqrt();
+            if best.as_ref().is_none_or(|(best_dist, _)| dist < *best_dist) {
+                best = Some((dist, deposit));
+            }
+        }
+    }
+    best.map(|(_, deposit)| deposit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nearest_deposit_within_finds_something_in_a_generous_radius() {
+        // DEPOSIT_CHANCE is sparse but not *that* sparse — a wide enough
+        // search radius from true (0, 0) should always find one in
+        // practice; this pins that down rather than assuming it.
+        let found = nearest_deposit_within(0.0, 0.0, 40);
+        assert!(found.is_some(), "expected at least one deposit within 40 chunks of the origin");
+    }
+
+    #[test]
+    fn nearest_deposit_within_returns_none_when_radius_too_small_to_ever_contain_one() {
+        // Radius 0 only ever checks the single chunk containing the query
+        // point — genuinely might contain a deposit by chance, so instead
+        // assert the *closest-of-many-samples* property: across many
+        // well-separated query points, at least some come back None at
+        // radius 0 (since DEPOSIT_CHANCE is well under 1).
+        let any_none = (0..50).any(|i| nearest_deposit_within(i as f64 * 10_000.0, 0.0, 0).is_none());
+        assert!(any_none, "expected at least one sampled point with no deposit in its own chunk");
+    }
 
     #[test]
     fn same_chunk_is_deterministic() {
