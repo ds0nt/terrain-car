@@ -296,6 +296,17 @@ pub struct BuildingSnapshot {
     pub true_z: f64,
     pub build_complete_at: f64,
     pub rotation_y: f32,
+    /// The actual surface height the server placed this on — a downward
+    /// raycast against its own authoritative physics world at placement
+    /// time (`server::economy::surface_height_at`), which for a `Ramp`
+    /// might be another `Ramp`'s own surface, not raw terrain. Carried
+    /// here (rather than every client re-deriving it independently via
+    /// `shared::terrain_gen::height_at`) so the rendered mesh can never
+    /// visually disagree with the real collider the server actually
+    /// placed — re-deriving from raw terrain height was exactly the bug
+    /// that made a stacked Ramp appear to "snap" back down to ground
+    /// level despite its physics staying correctly elevated.
+    pub ground_y: f32,
 }
 
 /// Sent client -> server: teleport the sender's own car to their Hangar —

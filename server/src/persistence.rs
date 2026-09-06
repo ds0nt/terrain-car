@@ -40,6 +40,7 @@ pub struct BuildingRow {
     pub true_z: f64,
     pub build_complete_at: Option<f64>,
     pub rotation_y: f64,
+    pub ground_y: f64,
 }
 
 /// Sent from Bevy systems to the persistence thread. Saves are
@@ -186,8 +187,8 @@ async fn save_wallet(pool: &PgPool, wallet: &WalletRow) -> sqlx::Result<()> {
 
 async fn save_building(pool: &PgPool, building: &BuildingRow) -> sqlx::Result<()> {
     sqlx::query(
-        "insert into buildings (id, owner_player_id, kind, true_x, true_z, build_complete_at, rotation_y) \
-         values ($1, $2, $3, $4, $5, $6, $7) \
+        "insert into buildings (id, owner_player_id, kind, true_x, true_z, build_complete_at, rotation_y, ground_y) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8) \
          on conflict (id) do update set build_complete_at = excluded.build_complete_at",
     )
     .bind(building.id)
@@ -197,6 +198,7 @@ async fn save_building(pool: &PgPool, building: &BuildingRow) -> sqlx::Result<()
     .bind(building.true_z)
     .bind(building.build_complete_at)
     .bind(building.rotation_y)
+    .bind(building.ground_y)
     .execute(pool)
     .await?;
     Ok(())
@@ -207,7 +209,7 @@ async fn load_all(pool: &PgPool) -> sqlx::Result<PersistenceEvent> {
         .fetch_all(pool)
         .await?;
     let buildings = sqlx::query_as::<_, BuildingRow>(
-        "select id, owner_player_id, kind, true_x, true_z, build_complete_at, rotation_y from buildings",
+        "select id, owner_player_id, kind, true_x, true_z, build_complete_at, rotation_y, ground_y from buildings",
     )
     .fetch_all(pool)
     .await?;

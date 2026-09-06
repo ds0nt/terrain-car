@@ -3,7 +3,6 @@ use bevy::prelude::*;
 use bevy_rapier3d::prelude::{Collider, Friction, RigidBody};
 use shared::buildings::{self, BuildingKind};
 use shared::protocol::BuildingSnapshot;
-use shared::terrain_gen::{height_at, TerrainNoise};
 use shared::time::now_unix;
 
 use crate::worldspace::WorldOrigin;
@@ -78,16 +77,25 @@ fn init_building_visuals(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     snapshots: Query<&BuildingSnapshot>,
-    noise: Res<TerrainNoise>,
     origin: Res<WorldOrigin>,
 ) {
     let Ok(snapshot) = snapshots.get(insert.entity) else {
         return;
     };
-    let ground_y = height_at(&noise, snapshot.true_x, snapshot.true_z);
+    // Uses the snapshot's own ground_y (the server's actual placement-time
+    // surface raycast) rather than re-deriving via height_at — re-deriving
+    // from raw terrain was exactly the bug that made a Ramp placed on top
+    // of another Ramp render back down at ground level despite its real
+    // collider staying correctly elevated (see ground_y's own docs).
     let local = (DVec3::new(snapshot.true_x, 0.0, snapshot.true_z) - origin.offset).as_vec3();
-    let (mesh, base_color, transform) =
-        building_mesh_and_transform(snapshot.kind, &mut meshes, local.x, local.z, ground_y, snapshot.rotation_y);
+    let (mesh, base_color, transform) = building_mesh_and_transform(
+        snapshot.kind,
+        &mut meshes,
+        local.x,
+        local.z,
+        snapshot.ground_y,
+        snapshot.rotation_y,
+    );
 
     let mut entity = commands.entity(insert.entity);
     entity.insert((

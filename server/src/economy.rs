@@ -130,7 +130,6 @@ fn apply_loaded_state(
     mut commands: Commands,
     persistence: Res<Persistence>,
     mut wallets: ResMut<Wallets>,
-    noise: Res<TerrainNoise>,
     origin: Res<WorldOrigin>,
 ) {
     while let Some(event) = persistence.try_recv() {
@@ -140,7 +139,7 @@ fn apply_loaded_state(
                     wallets.0.insert(wallet.player_id, (wallet.energy as f32, wallet.ore as f32));
                 }
                 for building in buildings {
-                    spawn_building_from_row(&mut commands, &noise, &origin, &building);
+                    spawn_building_from_row(&mut commands, &origin, &building);
                 }
                 info!(
                     "economy: applied {} loaded wallet(s)",
@@ -179,7 +178,7 @@ fn spawn_building(
     ground_y: f32,
 ) -> Entity {
     let mut entity = commands.spawn((
-        BuildingSnapshot { kind, owner_player_id, true_x, true_z, build_complete_at, rotation_y },
+        BuildingSnapshot { kind, owner_player_id, true_x, true_z, build_complete_at, rotation_y, ground_y },
         Replicated,
     ));
 
@@ -225,17 +224,11 @@ fn surface_height_at(
     }
 }
 
-fn spawn_building_from_row(
-    commands: &mut Commands,
-    noise: &TerrainNoise,
-    origin: &WorldOrigin,
-    row: &BuildingRow,
-) {
+fn spawn_building_from_row(commands: &mut Commands, origin: &WorldOrigin, row: &BuildingRow) {
     let Some(kind) = BuildingKind::from_db_str(&row.kind) else {
         warn!("economy: ignoring building {} with unknown kind `{}`", row.id, row.kind);
         return;
     };
-    let ground_y = height_at(noise, row.true_x, row.true_z);
     spawn_building(
         commands,
         origin,
@@ -245,7 +238,7 @@ fn spawn_building_from_row(
         row.true_z,
         row.build_complete_at.unwrap_or(0.0),
         row.rotation_y as f32,
-        ground_y,
+        row.ground_y as f32,
     );
 }
 
@@ -336,6 +329,7 @@ fn apply_place_building(
         true_z: place.true_z,
         build_complete_at: Some(build_complete_at),
         rotation_y: place.rotation_y as f64,
+        ground_y: ground_y as f64,
     }));
 }
 
