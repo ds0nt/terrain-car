@@ -1,16 +1,16 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
-use bevy_replicon::prelude::ClientTriggerExt;
+use bevy_replicon::prelude::{ClientState, ClientTriggerExt};
 use shared::auth::{validate_password, validate_username};
 use shared::protocol::{AuthResultMsg, LoginMsg, RegisterMsg};
 
 /// Real accounts, replacing the old "trust whatever UUID the client
 /// claims" identity — see `shared::protocol::RegisterMsg`/`LoginMsg`'s
-/// docs. Nothing spawns a *server-authoritative* car until `AuthState`
-/// reaches `LoggedIn` (the client's own locally-predicted car still
-/// appears immediately at `Startup`, same as always — see `car.rs`'s
-/// `spawn_car` docs on why that's left untouched; it just never merges
-/// with anything server-side until login succeeds).
+/// docs. Nothing is drivable until `AuthState` reaches `LoggedIn` — the
+/// client's own locally-predicted car (see `car.rs`'s
+/// `spawn_car_after_login`) doesn't spawn until then either, not just the
+/// server-authoritative one; only the world itself (terrain, camera) loads
+/// in the background while the login window is up.
 pub struct AuthUiPlugin;
 
 impl Plugin for AuthUiPlugin {
@@ -56,10 +56,23 @@ fn draw_login_window(
     mut state: ResMut<AuthState>,
     mut form: ResMut<LoginForm>,
     mut commands: Commands,
+    client_state: Res<State<ClientState>>,
 ) -> Result {
     if !matches!(*state, AuthState::LoggedOut | AuthState::Pending) {
         return Ok(());
     }
+
+    // Nothing to log into yet — the transport connection itself (see
+    // `net.rs`'s `connect_to_server`) hasn't finished. Shown as its own
+    // step rather than just a disabled form so it's obvious *what's*
+    // being waited on if the server happens to be unreachable.
+    if *client_state.get() != ClientState::Connected {
+        egui::Window::new("Log In").collapsible(false).resizable(false).show(contexts.ctx_mut()?, |ui| {
+            ui.label("Connecting to server...");
+        });
+        return Ok(());
+    }
+
     let pending = matches!(*state, AuthState::Pending);
 
     egui::Window::new("Log In").collapsible(false).resizable(false).show(contexts.ctx_mut()?, |ui| {

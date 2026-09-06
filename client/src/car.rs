@@ -10,6 +10,7 @@ pub use shared::protocol::LocalCar;
 use shared::protocol::Wallet;
 use shared::terrain_gen::{find_flat_spawn, height_at, TerrainNoise};
 
+use crate::auth_ui::AuthState;
 use crate::terrain::{RegenerateWorldEvent, TerrainTracker};
 use crate::worldspace::WorldOrigin;
 
@@ -22,8 +23,10 @@ impl Plugin for CarPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CarInput>()
             .add_message::<CarResetEvent>()
-            .add_systems(Startup, spawn_car)
-            .add_systems(Update, (read_car_input, flip_car_upright, reset_car_after_regen).chain())
+            .add_systems(
+                Update,
+                (spawn_car_after_login, read_car_input, flip_car_upright, reset_car_after_regen).chain(),
+            )
             // Physics lives in FixedUpdate (alongside Rapier itself, see
             // main.rs's `in_fixed_schedule()`) rather than Update, so the
             // suspension/drive step advances by a constant dt regardless of
@@ -75,14 +78,26 @@ fn read_car_input(keyboard: Res<ButtonInput<KeyCode>>, mut input: ResMut<CarInpu
 /// protocol.rs) so that once the server's authoritative version of this
 /// same car replicates in, bevy_replicon merges it into this entity instead
 /// of spawning a visible duplicate — this spawn *is* the client-side
-/// prediction: it runs immediately on Startup, before any server
-/// connection necessarily exists yet, so driving never waits on the
-/// network.
-fn spawn_car(
+/// prediction: it runs the instant login succeeds (not delayed further
+/// waiting on the server's own echo), so driving never waits on the round
+/// trip once you're actually in. Gated on `AuthState::LoggedIn` — see
+/// `auth_ui.rs` — rather than firing at `Startup` like it used to: nothing
+/// should be drivable before the player has actually logged in, only the
+/// world itself loads in the background while the login window is up.
+/// `spawned` is a one-shot latch, since `Update` runs every frame but this
+/// must only ever fire once per login.
+fn spawn_car_after_login(
     mut commands: Commands,
     noise: Res<TerrainNoise>,
     client_id: Res<crate::net::LocalClientId>,
+    auth_state: Res<AuthState>,
+    mut spawned: Local<bool>,
 ) {
+    if *spawned || !matches!(*auth_state, AuthState::LoggedIn) {
+        return;
+    }
+    *spawned = true;
+
     // WorldOrigin always starts at true (0, 0, 0), so local and true
     // coordinates coincide for this very first spawn. Terrain can be
     // genuinely extreme now, so search nearby for flat-ish ground rather
