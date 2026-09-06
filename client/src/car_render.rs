@@ -212,31 +212,68 @@ fn apply_car_cosmetics(
             (true, None) => {
                 let half_extents = chassis.half_extents;
                 // Top-right corner of the chassis box, riding just above
-                // the roof line — two overlapping small tori read as "a
-                // bow" well enough for a placeholder cosmetic, no
-                // external art assets needed (matches every other
-                // greeble in `init_car_visuals`).
+                // the roof line. Built from squashed spheres (ribbon
+                // loops), a small center knot, and two angled flattened
+                // tails — reads as an actual tied bow rather than the
+                // first version's two bare rings, still no external art
+                // assets needed (matches every other greeble in
+                // `init_car_visuals`).
                 let bow_center =
                     Vec3::new(half_extents.x * 0.75, half_extents.y * 2.0 + 0.15, -half_extents.z * 0.3);
                 let bow_material = materials.add(StandardMaterial {
                     base_color: Color::srgb(0.9, 0.15, 0.25),
-                    perceptual_roughness: 0.4,
+                    perceptual_roughness: 0.35,
                     ..default()
                 });
-                let loop_mesh = meshes.add(Torus::new(0.06, 0.16));
+
+                // Each loop is a unit sphere squashed flat and wide, then
+                // tilted so its flattened face reads as a puffed-out
+                // ribbon loop rather than a ball.
+                let loop_mesh = meshes.add(Sphere::new(0.16));
+                let knot_mesh = meshes.add(Sphere::new(0.075));
+                let tail_mesh = meshes.add(Cuboid::new(0.09, 0.045, 0.32));
+
                 commands.entity(entity).with_children(|parent| {
+                    // Left loop, splayed outward and tilted up.
                     parent.spawn((
                         Mesh3d(loop_mesh.clone()),
                         MeshMaterial3d(bow_material.clone()),
-                        Transform::from_translation(bow_center + Vec3::new(-0.1, 0.0, 0.0))
-                            .with_rotation(Quat::from_rotation_z(0.6)),
+                        Transform::from_translation(bow_center + Vec3::new(-0.15, 0.03, 0.0))
+                            .with_rotation(Quat::from_rotation_z(0.55) * Quat::from_rotation_x(0.3))
+                            .with_scale(Vec3::new(1.3, 0.55, 0.8)),
+                        BowMarker,
+                    ));
+                    // Right loop, mirrored.
+                    parent.spawn((
+                        Mesh3d(loop_mesh),
+                        MeshMaterial3d(bow_material.clone()),
+                        Transform::from_translation(bow_center + Vec3::new(0.15, 0.03, 0.0))
+                            .with_rotation(Quat::from_rotation_z(-0.55) * Quat::from_rotation_x(0.3))
+                            .with_scale(Vec3::new(1.3, 0.55, 0.8)),
+                        BowMarker,
+                    ));
+                    // Center knot, sitting slightly forward/above so it
+                    // overlaps both loops where they'd actually be tied.
+                    parent.spawn((
+                        Mesh3d(knot_mesh),
+                        MeshMaterial3d(bow_material.clone()),
+                        Transform::from_translation(bow_center + Vec3::new(0.0, 0.03, 0.03)),
+                        BowMarker,
+                    ));
+                    // Two ribbon tails, splayed apart and angled down/back
+                    // off the back of the knot.
+                    parent.spawn((
+                        Mesh3d(tail_mesh.clone()),
+                        MeshMaterial3d(bow_material.clone()),
+                        Transform::from_translation(bow_center + Vec3::new(-0.06, -0.08, 0.16))
+                            .with_rotation(Quat::from_rotation_y(0.35) * Quat::from_rotation_x(-0.5)),
                         BowMarker,
                     ));
                     parent.spawn((
-                        Mesh3d(loop_mesh),
+                        Mesh3d(tail_mesh),
                         MeshMaterial3d(bow_material),
-                        Transform::from_translation(bow_center + Vec3::new(0.1, 0.0, 0.0))
-                            .with_rotation(Quat::from_rotation_z(-0.6)),
+                        Transform::from_translation(bow_center + Vec3::new(0.06, -0.08, 0.16))
+                            .with_rotation(Quat::from_rotation_y(-0.35) * Quat::from_rotation_x(-0.5)),
                         BowMarker,
                     ));
                 });
