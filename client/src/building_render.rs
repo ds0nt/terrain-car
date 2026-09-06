@@ -23,53 +23,36 @@ impl Plugin for BuildingRenderPlugin {
     }
 }
 
-fn init_building_visuals(
-    insert: On<Insert, BuildingSnapshot>,
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    snapshots: Query<&BuildingSnapshot>,
-    noise: Res<TerrainNoise>,
-    origin: Res<WorldOrigin>,
-) {
-    let Ok(snapshot) = snapshots.get(insert.entity) else {
-        return;
-    };
-    let ground_y = height_at(&noise, snapshot.true_x, snapshot.true_z);
-    let local = (DVec3::new(snapshot.true_x, 0.0, snapshot.true_z) - origin.offset).as_vec3();
-
-    // Ramp is a real physics object (a car needs to drive on it), so it
-    // gets its own transform/collider path via the exact same pure
-    // `ramp_transform` function the server uses for its own collider —
-    // client and server can never disagree about where the surface is.
-    // Every other kind here is purely decorative (no collider at all).
-    if snapshot.kind == BuildingKind::Ramp {
-        let (translation, rotation) =
-            buildings::ramp_transform(local.x, local.z, ground_y, snapshot.rotation_y);
-        commands.entity(insert.entity).insert((
-            Mesh3d(meshes.add(Cuboid::new(
-                buildings::RAMP_HALF_WIDTH * 2.0,
-                buildings::RAMP_HALF_THICKNESS * 2.0,
-                buildings::RAMP_HALF_LENGTH * 2.0,
-            ))),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: Color::srgb(0.5, 0.45, 0.4),
-                perceptual_roughness: 0.8,
-                ..default()
-            })),
-            Transform::from_translation(translation).with_rotation(rotation),
-            RigidBody::Fixed,
-            Collider::cuboid(
-                buildings::RAMP_HALF_WIDTH,
-                buildings::RAMP_HALF_THICKNESS,
-                buildings::RAMP_HALF_LENGTH,
-            ),
-            Friction::coefficient(1.0),
+/// Mesh + base color + local-space transform for one building kind at a
+/// given placement — the actual per-kind geometry, shared by the real
+/// spawn (`init_building_visuals`) and the ghost preview
+/// (`building_placement.rs`) so the ghost always looks/sits exactly like
+/// what will actually be placed. `ground_y` and `rotation_y` come from the
+/// caller (a live raycast for the ghost, the replicated snapshot for the
+/// real thing).
+pub(crate) fn building_mesh_and_transform(
+    kind: BuildingKind,
+    meshes: &mut Assets<Mesh>,
+    local_x: f32,
+    local_z: f32,
+    ground_y: f32,
+    rotation_y: f32,
+) -> (Handle<Mesh>, Color, Transform) {
+    if kind == BuildingKind::Ramp {
+        let (translation, rotation) = buildings::ramp_transform(local_x, local_z, ground_y, rotation_y);
+        let mesh = meshes.add(Cuboid::new(
+            buildings::RAMP_HALF_WIDTH * 2.0,
+            buildings::RAMP_HALF_THICKNESS * 2.0,
+            buildings::RAMP_HALF_LENGTH * 2.0,
         ));
-        return;
+        return (
+            mesh,
+            Color::srgb(0.5, 0.45, 0.4),
+            Transform::from_translation(translation).with_rotation(rotation),
+        );
     }
 
-    let (mesh, base_color, half_height) = match snapshot.kind {
+    let (mesh, base_color, half_height) = match kind {
         BuildingKind::Hangar => {
             (meshes.add(Cuboid::new(4.0, 2.5, 5.0)), Color::srgb(0.45, 0.45, 0.5), 1.25)
         }
@@ -84,17 +67,55 @@ fn init_building_visuals(
         }
         BuildingKind::Ramp => unreachable!("handled above"),
     };
+    let transform = Transform::from_xyz(local_x, ground_y + half_height, local_z)
+        .with_rotation(Quat::from_rotation_y(rotation_y));
+    (mesh, base_color, transform)
+}
 
-    commands.entity(insert.entity).insert((
+fn init_building_visuals(
+    insert: On<Insert, BuildingSnapshot>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    snapshots: Query<&BuildingSnapshot>,
+    noise: Res<TerrainNoise>,
+    origin: Res<WorldOrigin>,
+) {
+    let Ok(snapshot) = snapshots.get(insert.entity) else {
+        return;
+    };
+    let ground_y = height_at(&noise, snapshot.true_x, snapshot.true_z);
+    let local = (DVec3::new(snapshot.true_x, 0.0, snapshot.true_z) - origin.offset).as_vec3();
+    let (mesh, base_color, transform) =
+        building_mesh_and_transform(snapshot.kind, &mut meshes, local.x, local.z, ground_y, snapshot.rotation_y);
+
+    let mut entity = commands.entity(insert.entity);
+    entity.insert((
         Mesh3d(mesh),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color,
             alpha_mode: AlphaMode::Blend,
             ..default()
         })),
-        Transform::from_xyz(local.x, ground_y + half_height, local.z)
-            .with_rotation(Quat::from_rotation_y(snapshot.rotation_y)),
+        transform,
     ));
+
+    // Ramp is a real physics object (a car needs to drive on it) — the
+    // exact same collider dimensions/pose the server uses for its own
+    // copy, so client-side prediction and server-authoritative physics
+    // can never disagree about where the surface is. Every other kind
+    // here is purely decorative (no collider at all).
+    if snapshot.kind == BuildingKind::Ramp {
+        entity.insert((
+            RigidBody::Fixed,
+            Collider::cuboid(
+                buildings::RAMP_HALF_WIDTH,
+                buildings::RAMP_HALF_THICKNESS,
+                buildings::RAMP_HALF_LENGTH,
+            ),
+            Friction::coefficient(1.0),
+        ));
+    }
 }
 
 /// Fades a building translucent while its `build_complete_at` is still in

@@ -1,3 +1,4 @@
+mod building_placement;
 mod building_render;
 mod building_ui;
 mod camera;
@@ -74,6 +75,7 @@ fn main() {
             tuning_ui::TuningUiPlugin,
             building_ui::BuildingUiPlugin,
             building_render::BuildingRenderPlugin,
+            building_placement::BuildingPlacementPlugin,
             villager_render::VillagerRenderPlugin,
         ));
 

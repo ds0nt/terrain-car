@@ -18,11 +18,12 @@ use crate::car_sim::{OwnedBy, PlayerIdentities};
 use crate::persistence::{BuildingRow, Persistence, PersistenceCommand, PersistenceEvent, WalletRow};
 
 /// How close (true-space) a placement request must be to the sender's own
-/// current position — placement is "where your car is," not an arbitrary
-/// point the client could otherwise claim. Generous enough to allow for
-/// normal input/network lag between "player pressed place" and the
-/// server processing it, nowhere near enough to place across the map.
-const MAX_PLACEMENT_DISTANCE: f64 = 25.0;
+/// current position — bounds "wherever you're pointing the camera," not an
+/// arbitrary point the client could otherwise claim, while staying
+/// generous enough for the mouse-raycast placement UI (client's
+/// `building_placement.rs`) to actually reach a spot worth aiming at,
+/// nowhere near enough to place across the map.
+const MAX_PLACEMENT_DISTANCE: f64 = 60.0;
 /// How often buildings actually produce resources — economy-scale time,
 /// not the 64Hz physics tick.
 const PRODUCTION_TICK_SECS: f32 = 1.0;
@@ -161,10 +162,13 @@ fn apply_loaded_state(
 /// `building_render.rs`) disagrees, fighting reconciliation constantly.
 /// Uses `shared::buildings::ramp_transform` — the exact same pure function
 /// the client calls for its visual mesh — so the two can never disagree
-/// about where the surface actually is.
+/// about where the surface actually is. `ground_y` is the caller's
+/// responsibility (usually `surface_height_at`, a downward raycast against
+/// the server's own authoritative Rapier world — which is what lets a
+/// Ramp start on top of another existing Ramp instead of always sitting on
+/// raw terrain).
 fn spawn_building(
     commands: &mut Commands,
-    noise: &TerrainNoise,
     origin: &WorldOrigin,
     kind: BuildingKind,
     owner_player_id: Uuid,
@@ -172,6 +176,7 @@ fn spawn_building(
     true_z: f64,
     build_complete_at: f64,
     rotation_y: f32,
+    ground_y: f32,
 ) -> Entity {
     let mut entity = commands.spawn((
         BuildingSnapshot { kind, owner_player_id, true_x, true_z, build_complete_at, rotation_y },
@@ -179,7 +184,6 @@ fn spawn_building(
     ));
 
     if kind.is_drivable_structure() {
-        let ground_y = height_at(noise, true_x, true_z);
         let local = (bevy::math::DVec3::new(true_x, 0.0, true_z) - origin.offset).as_vec3();
         let (translation, rotation) =
             shared::buildings::ramp_transform(local.x, local.z, ground_y, rotation_y);
@@ -198,6 +202,29 @@ fn spawn_building(
     entity.id()
 }
 
+/// Straight-down raycast against the server's own Rapier world to find
+/// whatever surface is actually at `(true_x, true_z)` — terrain, or an
+/// existing building's collider (a Ramp, say) sitting on top of it. Falls
+/// back to raw terrain height if nothing at all is hit (shouldn't happen
+/// in practice — terrain always has a collider — but a placement request
+/// is exactly the kind of place to not `unwrap` that assumption away).
+fn surface_height_at(
+    context: RapierContext<'_>,
+    noise: &TerrainNoise,
+    origin: &WorldOrigin,
+    true_x: f64,
+    true_z: f64,
+) -> f32 {
+    let local = (bevy::math::DVec3::new(true_x, 0.0, true_z) - origin.offset).as_vec3();
+    const RAY_START_HEIGHT: f32 = 10_000.0;
+    let ray_origin = Vec3::new(local.x, RAY_START_HEIGHT, local.z);
+    match context.cast_ray(ray_origin, Vec3::NEG_Y, RAY_START_HEIGHT * 2.0, true, QueryFilter::default())
+    {
+        Some((_, toi)) => RAY_START_HEIGHT - toi,
+        None => height_at(noise, true_x, true_z),
+    }
+}
+
 fn spawn_building_from_row(
     commands: &mut Commands,
     noise: &TerrainNoise,
@@ -208,9 +235,9 @@ fn spawn_building_from_row(
         warn!("economy: ignoring building {} with unknown kind `{}`", row.id, row.kind);
         return;
     };
+    let ground_y = height_at(noise, row.true_x, row.true_z);
     spawn_building(
         commands,
-        noise,
         origin,
         kind,
         row.owner_player_id,
@@ -218,6 +245,7 @@ fn spawn_building_from_row(
         row.true_z,
         row.build_complete_at.unwrap_or(0.0),
         row.rotation_y as f32,
+        ground_y,
     );
 }
 
@@ -234,6 +262,7 @@ fn apply_place_building(
     identities: Res<PlayerIdentities>,
     origin: Res<WorldOrigin>,
     noise: Res<TerrainNoise>,
+    rapier_context: ReadRapierContext,
     mut wallets: ResMut<Wallets>,
     persistence: Res<Persistence>,
     mut commands: Commands,
@@ -284,9 +313,12 @@ fn apply_place_building(
 
     let building_id = Uuid::new_v4();
     let build_complete_at = now_unix() + place.kind.build_time_secs() as f64;
+    let ground_y = match rapier_context.single() {
+        Ok(context) => surface_height_at(context, &noise, &origin, place.true_x, place.true_z),
+        Err(_) => height_at(&noise, place.true_x, place.true_z),
+    };
     spawn_building(
         &mut commands,
-        &noise,
         &origin,
         place.kind,
         player_id,
@@ -294,6 +326,7 @@ fn apply_place_building(
         place.true_z,
         build_complete_at,
         place.rotation_y,
+        ground_y,
     );
     persistence.send(PersistenceCommand::SaveBuilding(BuildingRow {
         id: building_id,

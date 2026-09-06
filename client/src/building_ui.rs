@@ -2,16 +2,16 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
 use bevy_replicon::prelude::ClientTriggerExt;
 use shared::buildings::BuildingKind;
-use shared::protocol::{PlaceBuildingMsg, RecallToHangarMsg, Wallet};
-use shared::worldspace::WorldOrigin;
+use shared::protocol::{RecallToHangarMsg, Wallet};
 
+use crate::building_placement::SelectBuildingKind;
 use crate::car::LocalCar;
 
-/// Live build menu (`B` to toggle) plus the recall-to-Hangar binding (`H`,
-/// not gated behind the menu — meant to be usable mid-drive). All the
-/// actual placement logic (funds, deposit proximity, distance-from-car) is
-/// server-side (`server/src/economy.rs`); this is purely "press B, click
-/// Place, send the message."
+/// Build menu (`B` to toggle) plus the recall-to-Hangar binding (`H`, not
+/// gated behind the menu — meant to be usable mid-drive). Clicking a kind
+/// here doesn't place it directly anymore — it fires `SelectBuildingKind`,
+/// which hands off to `building_placement.rs`'s mouse-raycast ghost/click
+/// flow for actually choosing where (and for a Ramp, which way) it goes.
 ///
 /// Doesn't register `bevy_egui::EguiPlugin` itself — `tuning_ui.rs`
 /// (registered earlier in `main.rs`) already does, and Bevy panics on a
@@ -51,22 +51,18 @@ const BUILDING_KINDS: [BuildingKind; 5] = [
 
 fn draw_build_menu(
     mut contexts: EguiContexts,
-    open: Res<BuildMenuOpen>,
-    mut commands: Commands,
-    origin: Res<WorldOrigin>,
-    car_q: Query<(&Transform, &Wallet), With<LocalCar>>,
+    mut open: ResMut<BuildMenuOpen>,
+    mut select_events: MessageWriter<SelectBuildingKind>,
+    car_q: Query<&Wallet, With<LocalCar>>,
 ) -> Result {
     if !open.0 {
         return Ok(());
     }
-    let Ok((transform, wallet)) = car_q.single() else {
+    let Ok(wallet) = car_q.single() else {
         return Ok(());
     };
-    let true_pos = origin.to_true(transform.translation);
-    // Captured so a Ramp faces the way the car was pointed at placement —
-    // see PlaceBuildingMsg's docs; every other kind ignores this.
-    let (rotation_y, _, _) = transform.rotation.to_euler(EulerRot::YXZ);
 
+    let mut close = false;
     egui::Window::new("Build (B to close)").show(contexts.ctx_mut()?, |ui| {
         ui.label(format!("Energy: {:.0}   Ore: {:.0}", wallet.energy, wallet.ore));
         ui.separator();
@@ -78,19 +74,22 @@ fn draw_build_menu(
                     "{kind:?}  ({:.0}s build)  cost: {cost_energy:.0} energy, {cost_ore:.0} ore",
                     kind.build_time_secs(),
                 ));
-                if ui.add_enabled(affordable, egui::Button::new("Place here")).clicked() {
-                    commands.client_trigger(PlaceBuildingMsg {
-                        kind,
-                        true_x: true_pos.x,
-                        true_z: true_pos.z,
-                        rotation_y,
-                    });
+                if ui.add_enabled(affordable, egui::Button::new("Select")).clicked() {
+                    select_events.write(SelectBuildingKind(kind));
+                    close = true;
                 }
             });
         }
         ui.separator();
+        ui.label("After selecting: click in the world to place it.");
+        ui.label("Ramp: click to anchor it, drag before releasing to aim it.");
+        ui.label("Escape or right-click cancels a pending placement.");
+        ui.separator();
         ui.label("H: recall your car to your Hangar (anytime, not just here)");
     });
+    if close {
+        open.0 = false;
+    }
 
     Ok(())
 }
