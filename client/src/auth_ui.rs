@@ -3,6 +3,7 @@ use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use bevy_replicon::prelude::{ClientState, ClientTriggerExt};
 use shared::auth::{validate_password, validate_username};
 use shared::protocol::{AuthResultMsg, LoginMsg, RegisterMsg};
+use uuid::Uuid;
 
 /// Real accounts, replacing the old "trust whatever UUID the client
 /// claims" identity — see `shared::protocol::RegisterMsg`/`LoginMsg`'s
@@ -25,6 +26,7 @@ impl Plugin for AuthUiPlugin {
         app.add_plugins(EguiPlugin::default())
             .init_resource::<AuthState>()
             .init_resource::<LoginForm>()
+            .init_resource::<LocalPlayerId>()
             .add_message::<LoginAttempted>()
             .add_observer(apply_auth_result)
             .add_systems(EguiPrimaryContextPass, draw_login_window);
@@ -37,6 +39,15 @@ impl Plugin for AuthUiPlugin {
 /// `AuthResultMsg`.
 #[derive(Message, Clone, Copy)]
 pub struct LoginAttempted;
+
+/// The local account's own durable id, once known — `None` until login
+/// succeeds. `selection.rs` needs this to tell "a building I own" (shows
+/// actionable buttons) from "someone else's" (read-only info only) among
+/// clicked buildings, which nothing client-side otherwise keeps around
+/// (car.rs's own predicted spawn deliberately doesn't need it — see that
+/// function's docs).
+#[derive(Resource, Default)]
+pub struct LocalPlayerId(pub Option<Uuid>);
 
 /// Where the last-used username is cached purely to prefill the login
 /// form on relaunch — never the password, and never trusted for anything;
@@ -161,10 +172,16 @@ fn try_submit(
     *state = AuthState::Pending;
 }
 
-fn apply_auth_result(result: On<AuthResultMsg>, mut state: ResMut<AuthState>, mut form: ResMut<LoginForm>) {
+fn apply_auth_result(
+    result: On<AuthResultMsg>,
+    mut state: ResMut<AuthState>,
+    mut form: ResMut<LoginForm>,
+    mut local_player_id: ResMut<LocalPlayerId>,
+) {
     if result.ok {
         let player_id = result.player_id.expect("AuthResultMsg with ok=true always carries a player_id");
         info!("client: logged in as `{player_id}`");
+        local_player_id.0 = Some(player_id);
         *state = AuthState::LoggedIn;
         form.password.clear();
     } else {

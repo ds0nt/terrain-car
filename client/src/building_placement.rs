@@ -39,7 +39,7 @@ impl Plugin for BuildingPlacementPlugin {
 pub struct SelectBuildingKind(pub BuildingKind);
 
 #[derive(Resource, Default)]
-enum PlacementState {
+pub(crate) enum PlacementState {
     #[default]
     Idle,
     /// Ghost follows the raycast hit; a click either places immediately
@@ -49,6 +49,15 @@ enum PlacementState {
     /// from the moment the mouse went down; dragging further only changes
     /// `rotation_y`, released to confirm.
     Aiming { anchor_local: Vec3, anchor_true_x: f64, anchor_true_z: f64, rotation_y: f32 },
+}
+
+impl PlacementState {
+    /// `selection.rs`'s click-to-select must not steal a click that's
+    /// actually part of placing a new building — this is the one flag
+    /// that already fully tracks "am I busy placing something."
+    pub(crate) fn is_idle(&self) -> bool {
+        matches!(self, PlacementState::Idle)
+    }
 }
 
 #[derive(Component)]
