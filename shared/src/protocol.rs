@@ -249,6 +249,36 @@ pub struct Wallet {
     pub ore: f32,
 }
 
+/// Purely cosmetic per-car choices — kept as its own component (not folded
+/// into `CarChassis`) because `CarChassis` is `replicate_once` (nothing
+/// mutates a car's tuning after spawn now that client-side tuning is
+/// gone), while these genuinely change mid-session whenever a player picks
+/// a new color or toggles the bow, and need every other client to see
+/// that change, not just the value at spawn — the same "replicated,
+/// changes over time" shape `Wallet` already has.
+#[derive(Component, Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct CarCosmetics {
+    /// Overrides `CarChassis::color_seed`'s automatic owner-hash color
+    /// when set — `None` means "just use the automatic color," which is
+    /// also every car's starting state.
+    pub custom_color: Option<[f32; 3]>,
+    pub has_bow: bool,
+}
+
+/// Sent client -> server whenever the player changes their own cosmetics
+/// (see client's `cosmetics_ui.rs`) — carries the full desired state, not
+/// a delta, same reasoning `TuneCarMsg` used to. The server writes it
+/// straight onto the sender's own car (found via `OwnedBy`, same
+/// authorization shape `FlipUprightMsg`'s handler already uses) with no
+/// further validation: there's no cost, no balance implication, nothing
+/// to cheat by picking a color, so there's nothing to check beyond "is
+/// this genuinely your own car."
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct SetCosmeticsMsg {
+    pub custom_color: Option<[f32; 3]>,
+    pub has_bow: bool,
+}
+
 /// A player's own free resource-gathering helper — spawned automatically
 /// the moment they're first identified, independent of any building, so
 /// there's always *some* way to recover energy/ore even starting from a
@@ -380,6 +410,8 @@ pub fn register_protocol(app: &mut App) {
         .add_client_event::<LoginMsg>(Channel::Ordered)
         .add_server_event::<AuthResultMsg>(Channel::Ordered)
         .replicate::<Wallet>()
+        .replicate::<CarCosmetics>()
+        .add_client_event::<SetCosmeticsMsg>(Channel::Ordered)
         .replicate::<BuildingSnapshot>()
         .replicate::<VillagerSnapshot>()
         .add_client_event::<PlaceBuildingMsg>(Channel::Ordered)

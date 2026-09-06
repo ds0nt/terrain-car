@@ -11,8 +11,8 @@ use shared::car_physics::{
 };
 use shared::combat::{Health, DEFAULT_MAX_HEALTH};
 use shared::protocol::{
-    spawn_car_signature, CarInputMsg, CarResetMsg, CarSnapshot, FlipUprightMsg, PlayerInfo,
-    RegenRequestMsg, Wallet, WorldRegenMsg,
+    spawn_car_signature, CarCosmetics, CarInputMsg, CarResetMsg, CarSnapshot, FlipUprightMsg,
+    PlayerInfo, RegenRequestMsg, SetCosmeticsMsg, Wallet, WorldRegenMsg,
 };
 use uuid::Uuid;
 use shared::terrain_gen::{find_flat_spawn, height_at, random_seed, TerrainNoise};
@@ -56,6 +56,7 @@ impl Plugin for CarSimPlugin {
             .add_observer(apply_car_input)
             .add_observer(apply_car_reset)
             .add_observer(apply_flip_upright)
+            .add_observer(apply_set_cosmetics)
             .add_observer(apply_world_regen_request)
             .add_systems(FixedUpdate, step_cars.before(PhysicsSet::SyncBackend))
             .add_systems(Update, recover_lost_cars);
@@ -291,6 +292,9 @@ pub(crate) fn spawn_car_for(
             // ordinary replication (see client's `players_ui.rs`) — no
             // separate roster message/lifecycle needed.
             PlayerInfo { player_id, username },
+            // Starts at defaults (automatic owner-hash color, no bow) —
+            // see `apply_set_cosmetics` for how a player changes this.
+            CarCosmetics::default(),
         ),
     ));
 
@@ -430,6 +434,28 @@ fn apply_flip_upright(
         *velocity = Velocity::zero();
         *ext_force = ExternalForce::default();
         snapshot.reset_generation = snapshot.reset_generation.wrapping_add(1);
+        break;
+    }
+}
+
+/// Writes a player's chosen cosmetics onto their own car — same
+/// authorization shape `apply_flip_upright` already uses (find the car
+/// `OwnedBy` the sending connection, mutate it, done). No further
+/// validation: color/bow choices cost nothing and affect no game state,
+/// so there's nothing to cheat by lying about them.
+fn apply_set_cosmetics(
+    set_msg: On<FromClient<SetCosmeticsMsg>>,
+    mut cars: Query<(&OwnedBy, &mut CarCosmetics)>,
+) {
+    let Some(client_entity) = set_msg.client_id.entity() else {
+        return;
+    };
+    for (owner, mut cosmetics) in &mut cars {
+        if owner.0 != client_entity {
+            continue;
+        }
+        cosmetics.custom_color = set_msg.custom_color;
+        cosmetics.has_bow = set_msg.has_bow;
         break;
     }
 }

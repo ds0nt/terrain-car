@@ -7,7 +7,7 @@ use shared::car_physics::{compute_wheel_forces, Wheel, WheelStepInput};
 use shared::buildings::{STARTING_ENERGY, STARTING_ORE};
 use shared::combat::{Health, DEFAULT_MAX_HEALTH};
 pub use shared::protocol::LocalCar;
-use shared::protocol::Wallet;
+use shared::protocol::{CarCosmetics, Wallet};
 use shared::terrain_gen::{find_flat_spawn, height_at, TerrainNoise};
 
 use crate::auth_ui::LoginAttempted;
@@ -159,6 +159,7 @@ fn spawn_car_after_login(
         // "usually right, corrected fast if not" tradeoff CarChassis's
         // color_seed guess already accepts.
         Wallet { energy: STARTING_ENERGY, ore: STARTING_ORE },
+        CarCosmetics::default(),
         TerrainTracker,
         LocalCar(client_id.0),
     ));

@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 use shared::car_physics::{wheel_mounts, CarChassis, Wheel};
-use shared::protocol::{CarSnapshot, LocalCar};
+use shared::protocol::{CarCosmetics, CarSnapshot, LocalCar};
 use shared::worldspace::WorldOrigin;
 
 use crate::owner_color::color_from_seed;
@@ -10,7 +10,7 @@ pub struct CarRenderPlugin;
 impl Plugin for CarRenderPlugin {
     fn build(&self, app: &mut App) {
         app.add_observer(init_car_visuals)
-            .add_systems(Update, sync_remote_car_transforms);
+            .add_systems(Update, (sync_remote_car_transforms, apply_car_cosmetics));
     }
 }
 
@@ -170,5 +170,77 @@ fn sync_remote_car_transforms(
         let local = (snapshot.translation.as_dvec3() - origin.offset).as_vec3();
         transform.translation = local;
         transform.rotation = snapshot.rotation;
+    }
+}
+
+/// Tags the bow child mesh so `apply_car_cosmetics` can find and despawn
+/// it again on the next change, without needing to remember the child's
+/// `Entity` anywhere.
+#[derive(Component)]
+struct BowMarker;
+
+/// Applies `CarCosmetics` to a car's existing mesh/material (spawned
+/// generically by `init_car_visuals`, unaware of cosmetics at that
+/// point) — a custom paint color overriding the automatic owner-hash one,
+/// and a decorative bow child mesh. `Changed<CarCosmetics>` already fires
+/// on the very first insert (Bevy's own change-detection rule), so this
+/// one system handles both the initial application and every later
+/// change a player makes, local or remote.
+fn apply_car_cosmetics(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    changed: Query<
+        (Entity, &CarChassis, &CarCosmetics, &MeshMaterial3d<StandardMaterial>, Option<&Children>),
+        Changed<CarCosmetics>,
+    >,
+    bow_q: Query<(), With<BowMarker>>,
+) {
+    for (entity, chassis, cosmetics, material_handle, children) in &changed {
+        if let Some(mut material) = materials.get_mut(&material_handle.0) {
+            material.base_color = cosmetics
+                .custom_color
+                .map(|c| Color::srgb(c[0], c[1], c[2]))
+                .unwrap_or_else(|| color_from_seed(chassis.color_seed));
+        }
+
+        let existing_bow =
+            children.into_iter().flatten().find(|child| bow_q.contains(**child)).copied();
+        match (cosmetics.has_bow, existing_bow) {
+            (true, Some(_)) | (false, None) => {}
+            (false, Some(bow)) => commands.entity(bow).despawn(),
+            (true, None) => {
+                let half_extents = chassis.half_extents;
+                // Top-right corner of the chassis box, riding just above
+                // the roof line — two overlapping small tori read as "a
+                // bow" well enough for a placeholder cosmetic, no
+                // external art assets needed (matches every other
+                // greeble in `init_car_visuals`).
+                let bow_center =
+                    Vec3::new(half_extents.x * 0.75, half_extents.y * 2.0 + 0.15, -half_extents.z * 0.3);
+                let bow_material = materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.9, 0.15, 0.25),
+                    perceptual_roughness: 0.4,
+                    ..default()
+                });
+                let loop_mesh = meshes.add(Torus::new(0.06, 0.16));
+                commands.entity(entity).with_children(|parent| {
+                    parent.spawn((
+                        Mesh3d(loop_mesh.clone()),
+                        MeshMaterial3d(bow_material.clone()),
+                        Transform::from_translation(bow_center + Vec3::new(-0.1, 0.0, 0.0))
+                            .with_rotation(Quat::from_rotation_z(0.6)),
+                        BowMarker,
+                    ));
+                    parent.spawn((
+                        Mesh3d(loop_mesh),
+                        MeshMaterial3d(bow_material),
+                        Transform::from_translation(bow_center + Vec3::new(0.1, 0.0, 0.0))
+                            .with_rotation(Quat::from_rotation_z(-0.6)),
+                        BowMarker,
+                    ));
+                });
+            }
+        }
     }
 }

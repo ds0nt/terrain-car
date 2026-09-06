@@ -5,6 +5,7 @@ mod building_ui;
 mod camera;
 mod car;
 mod car_render;
+mod cosmetics_ui;
 mod fx;
 mod hud;
 mod lighting;
@@ -81,7 +82,7 @@ fn main() {
             villager_render::VillagerRenderPlugin,
             auth_ui::AuthUiPlugin,
         ))
-        .add_plugins((pings::PingsPlugin, players_ui::PlayersUiPlugin));
+        .add_plugins((pings::PingsPlugin, players_ui::PlayersUiPlugin, cosmetics_ui::CosmeticsUiPlugin));
 
     // Registers replicated components/events — must use the exact same
     // function the server calls, so wire IDs (assigned in registration
