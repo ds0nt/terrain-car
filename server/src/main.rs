@@ -1,3 +1,4 @@
+mod auth;
 mod car_sim;
 mod console;
 mod economy;
@@ -69,7 +70,8 @@ fn main() {
         weapons::WeaponsPlugin,
         economy::EconomyPlugin,
         villagers::VillagersPlugin,
-    ));
+    ))
+    .add_plugins(auth::AuthPlugin);
 
     // Registers replicated components/events — must use the exact same
     // function the client calls, so wire IDs (assigned in registration

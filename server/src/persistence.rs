@@ -1,7 +1,11 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
+use argon2::password_hash::rand_core::OsRng;
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::Argon2;
 use bevy::prelude::*;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{FromRow, PgPool};
@@ -46,11 +50,16 @@ pub struct BuildingRow {
 /// Sent from Bevy systems to the persistence thread. Saves are
 /// fire-and-forget from the caller's perspective — a failed save just logs
 /// a warning on the thread and gets superseded by the next periodic save,
-/// never propagates an error back into the game loop.
+/// never propagates an error back into the game loop. `Register`/`Login`
+/// are the one exception that isn't fire-and-forget — see `AuthResult`.
 pub enum PersistenceCommand {
-    UpsertPlayer(Uuid),
     SaveWallet(WalletRow),
     SaveBuilding(BuildingRow),
+    /// `client_entity` rides along purely so the reply (`AuthResult`) can
+    /// be routed back to the right connection — the persistence thread has
+    /// no other notion of "which client asked this."
+    Register { client_entity: Entity, username: String, password: String },
+    Login { client_entity: Entity, username: String, password: String },
 }
 
 /// Sent back from the persistence thread once loaded — currently only
@@ -58,6 +67,18 @@ pub enum PersistenceCommand {
 pub enum PersistenceEvent {
     Loaded { wallets: Vec<WalletRow>, buildings: Vec<BuildingRow> },
     Unavailable,
+    AuthResult { client_entity: Entity, outcome: AuthOutcome },
+}
+
+/// Result of a `Register`/`Login` command — see `server::auth`, which
+/// drains these and turns them into an `AuthResultMsg` back to the client.
+pub enum AuthOutcome {
+    Success(Uuid),
+    UsernameTaken,
+    /// Deliberately covers both "no such username" and "wrong password"
+    /// identically — see `LoginMsg`'s own docs on why.
+    InvalidCredentials,
+    Error(String),
 }
 
 /// `Receiver` is `Send` but not `Sync`; wrapping in a `Mutex` is simpler
@@ -66,6 +87,13 @@ pub enum PersistenceEvent {
 pub struct Persistence {
     tx: Sender<PersistenceCommand>,
     rx: Mutex<Receiver<PersistenceEvent>>,
+    /// Set by the persistence thread itself right after it connects and
+    /// migrates successfully — a separate signal from the `mpsc` channel
+    /// (not something read via `try_recv()`) so `server::auth` can check
+    /// it synchronously before ever sending a `Register`/`Login` command,
+    /// without competing with `economy::apply_loaded_state` (the channel's
+    /// sole drain point) for events.
+    available: Arc<AtomicBool>,
 }
 
 impl Persistence {
@@ -86,22 +114,35 @@ impl Persistence {
     pub fn try_recv(&self) -> Option<PersistenceEvent> {
         self.rx.lock().ok()?.try_recv().ok()
     }
+
+    /// Whether the background thread is actually connected — accounts are
+    /// impossible without a real database (unlike wallets/buildings, which
+    /// degrade gracefully to in-memory-only), so `server::auth` checks
+    /// this up front and rejects immediately rather than sending a
+    /// `Register`/`Login` command that would otherwise vanish silently
+    /// once the thread has already given up and exited.
+    pub fn is_available(&self) -> bool {
+        self.available.load(Ordering::Relaxed)
+    }
 }
 
 fn spawn_persistence_thread(mut commands: Commands) {
     let (cmd_tx, cmd_rx) = channel::<PersistenceCommand>();
     let (event_tx, event_rx) = channel::<PersistenceEvent>();
+    let available = Arc::new(AtomicBool::new(false));
 
     let db_url = std::env::var("SUPABASE_DB_URL").ok();
-    thread::spawn(move || run_persistence_thread(db_url, cmd_rx, event_tx));
+    let thread_available = available.clone();
+    thread::spawn(move || run_persistence_thread(db_url, cmd_rx, event_tx, thread_available));
 
-    commands.insert_resource(Persistence { tx: cmd_tx, rx: Mutex::new(event_rx) });
+    commands.insert_resource(Persistence { tx: cmd_tx, rx: Mutex::new(event_rx), available });
 }
 
 fn run_persistence_thread(
     db_url: Option<String>,
     cmd_rx: Receiver<PersistenceCommand>,
     event_tx: Sender<PersistenceEvent>,
+    available: Arc<AtomicBool>,
 ) {
     let Some(db_url) = db_url else {
         warn!("persistence: SUPABASE_DB_URL not set — buildings/wallets will not persist");
@@ -134,6 +175,7 @@ fn run_persistence_thread(
             return;
         }
         info!("persistence: connected and migrated");
+        available.store(true, Ordering::Relaxed);
 
         if let Ok(loaded) = load_all(&pool).await {
             let _ = event_tx.send(loaded);
@@ -141,11 +183,6 @@ fn run_persistence_thread(
 
         while let Ok(command) = cmd_rx.recv() {
             match command {
-                PersistenceCommand::UpsertPlayer(player_id) => {
-                    if let Err(e) = upsert_player(&pool, player_id).await {
-                        warn!("persistence: failed to upsert player {player_id}: {e}");
-                    }
-                }
                 PersistenceCommand::SaveWallet(wallet) => {
                     if let Err(e) = save_wallet(&pool, &wallet).await {
                         warn!("persistence: failed to save wallet for {}: {e}", wallet.player_id);
@@ -156,20 +193,87 @@ fn run_persistence_thread(
                         warn!("persistence: failed to save building {}: {e}", building.id);
                     }
                 }
+                PersistenceCommand::Register { client_entity, username, password } => {
+                    let outcome = register(&pool, &username, &password).await;
+                    let _ = event_tx.send(PersistenceEvent::AuthResult { client_entity, outcome });
+                }
+                PersistenceCommand::Login { client_entity, username, password } => {
+                    let outcome = login(&pool, &username, &password).await;
+                    let _ = event_tx.send(PersistenceEvent::AuthResult { client_entity, outcome });
+                }
             }
         }
     });
 }
 
-async fn upsert_player(pool: &PgPool, player_id: Uuid) -> sqlx::Result<()> {
-    sqlx::query(
-        "insert into players (id, first_seen) values ($1, extract(epoch from now())) \
-         on conflict (id) do nothing",
+/// Argon2 with its own library defaults (a strong, non-trivial cost —
+/// deliberately not tuned lighter for "speed," since this only ever runs
+/// once per register/login, never in a hot path) and a fresh random salt
+/// per password, PHC-string-encoded so the salt/params travel with the
+/// hash itself — `verify_password` needs nothing but that one string back.
+fn hash_password(password: &str) -> Result<String, String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|e| e.to_string())
+}
+
+fn verify_password(password: &str, hash: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(hash) else {
+        return false;
+    };
+    Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
+}
+
+async fn register(pool: &PgPool, username: &str, password: &str) -> AuthOutcome {
+    let password_hash = match hash_password(password) {
+        Ok(hash) => hash,
+        Err(e) => return AuthOutcome::Error(e),
+    };
+    let player_id = Uuid::new_v4();
+    let result = sqlx::query(
+        "insert into players (id, username, password_hash, first_seen) \
+         values ($1, $2, $3, extract(epoch from now()))",
     )
     .bind(player_id)
+    .bind(username)
+    .bind(&password_hash)
     .execute(pool)
-    .await?;
-    Ok(())
+    .await;
+
+    match result {
+        Ok(_) => AuthOutcome::Success(player_id),
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => AuthOutcome::UsernameTaken,
+        Err(e) => {
+            warn!("persistence: register failed for `{username}`: {e}");
+            AuthOutcome::Error("registration failed".to_string())
+        }
+    }
+}
+
+async fn login(pool: &PgPool, username: &str, password: &str) -> AuthOutcome {
+    let row = sqlx::query_as::<_, (Uuid, String)>(
+        "select id, password_hash from players where username = $1",
+    )
+    .bind(username)
+    .fetch_optional(pool)
+    .await;
+
+    match row {
+        Ok(Some((player_id, password_hash))) => {
+            if verify_password(password, &password_hash) {
+                AuthOutcome::Success(player_id)
+            } else {
+                AuthOutcome::InvalidCredentials
+            }
+        }
+        Ok(None) => AuthOutcome::InvalidCredentials,
+        Err(e) => {
+            warn!("persistence: login lookup failed for `{username}`: {e}");
+            AuthOutcome::Error("login failed".to_string())
+        }
+    }
 }
 
 async fn save_wallet(pool: &PgPool, wallet: &WalletRow) -> sqlx::Result<()> {

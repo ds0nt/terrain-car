@@ -11,14 +11,13 @@ use shared::car_physics::{
 };
 use shared::combat::{Health, DEFAULT_MAX_HEALTH};
 use shared::protocol::{
-    spawn_car_signature, CarInputMsg, CarResetMsg, CarSnapshot, FlipUprightMsg, IdentifyMsg,
-    RegenRequestMsg, TuneCarMsg, Wallet, WorldRegenMsg,
+    spawn_car_signature, CarInputMsg, CarResetMsg, CarSnapshot, FlipUprightMsg, RegenRequestMsg,
+    TuneCarMsg, Wallet, WorldRegenMsg,
 };
 use uuid::Uuid;
 use shared::terrain_gen::{find_flat_spawn, height_at, random_seed, TerrainNoise};
 use shared::worldspace::WorldOrigin;
 
-use crate::persistence::{Persistence, PersistenceCommand};
 use crate::terrain_phys::{regenerate_terrain_colliders, ServerTerrainEntity};
 use crate::weapons::LastFired;
 
@@ -52,13 +51,12 @@ impl Plugin for CarSimPlugin {
             .init_resource::<OpList>()
             .init_resource::<CurrentWorldState>()
             .init_resource::<PlayerIdentities>()
-            .add_observer(spawn_car_on_connect)
+            .add_observer(register_client_on_connect)
             .add_observer(despawn_car_on_disconnect)
             .add_observer(apply_car_input)
             .add_observer(apply_car_reset)
             .add_observer(apply_flip_upright)
             .add_observer(apply_car_tune)
-            .add_observer(apply_identify)
             .add_observer(apply_world_regen_request)
             .add_systems(FixedUpdate, step_cars.before(PhysicsSet::SyncBackend))
             .add_systems(Update, recover_lost_cars);
@@ -95,6 +93,10 @@ impl PlayerRegistry {
         self.by_index.get(&index).copied()
     }
 
+    pub fn index_for(&self, client_entity: Entity) -> Option<u32> {
+        self.by_entity.get(&client_entity).copied()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (u32, Entity)> + '_ {
         self.by_index.iter().map(|(&i, &e)| (i, e))
     }
@@ -116,27 +118,16 @@ impl PlayerIdentities {
         self.0.get(&client_entity).copied()
     }
 
+    /// Called once by `server::auth` right after a successful
+    /// login/register — the sole place a client entity ever earns a
+    /// `PersistentPlayerId` now that nothing is simply trusted off the
+    /// wire (see `AuthResultMsg`'s docs).
+    pub(crate) fn insert(&mut self, client_entity: Entity, player_id: Uuid) {
+        self.0.insert(client_entity, player_id);
+    }
+
     fn remove(&mut self, client_entity: Entity) {
         self.0.remove(&client_entity);
-    }
-}
-
-fn apply_identify(
-    identify: On<FromClient<IdentifyMsg>>,
-    mut identities: ResMut<PlayerIdentities>,
-    persistence: Res<Persistence>,
-) {
-    let Some(client_entity) = identify.client_id.entity() else {
-        return;
-    };
-    let is_new = identities.0.insert(client_entity, identify.player_id).is_none();
-    if is_new {
-        // Only worth a round-trip the first time this connection
-        // identifies (IdentifyMsg is otherwise resent every couple of
-        // seconds for the reasons in its own docs) — an `on conflict do
-        // nothing` upsert either way, so a duplicate would be harmless,
-        // just wasted.
-        persistence.send(PersistenceCommand::UpsertPlayer(identify.player_id));
     }
 }
 
@@ -219,17 +210,33 @@ fn pick_spawn_point(
     spawn_true
 }
 
-fn spawn_car_on_connect(
-    add: On<Add, ConnectedClient>,
-    mut commands: Commands,
-    noise: Res<TerrainNoise>,
-    origin: Res<WorldOrigin>,
-    mut registry: ResMut<PlayerRegistry>,
-    mut anchor: ResMut<SpawnAnchor>,
-    world_state: Res<CurrentWorldState>,
-    network_ids: Query<&NetworkId>,
-) {
+/// Just assigns the operator-friendly player number (see `PlayerRegistry`)
+/// the moment a connection is established — independent of login, since an
+/// admin should be able to see/kick a connection that's just sitting on
+/// the login screen. No car exists yet; see `spawn_car_for`, called once
+/// this client actually authenticates (`server::auth`).
+fn register_client_on_connect(add: On<Add, ConnectedClient>, mut registry: ResMut<PlayerRegistry>) {
     let client_entity = add.entity;
+    let index = registry.assign(client_entity);
+    info!("server: client `{client_entity}` connected (player #{index}, not yet logged in)");
+}
+
+/// Spawns the authoritative car for a client that just logged in
+/// successfully (see `server::auth`) — `wallet` is already known at this
+/// point (looked up from `economy::Wallets` by the caller), so unlike the
+/// old identify-then-catch-up flow there's no transitional 0/0 state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_car_for(
+    commands: &mut Commands,
+    noise: &TerrainNoise,
+    origin: &WorldOrigin,
+    registry: &PlayerRegistry,
+    anchor: &mut SpawnAnchor,
+    world_state: &CurrentWorldState,
+    network_ids: &Query<&NetworkId>,
+    client_entity: Entity,
+    wallet: Wallet,
+) -> DVec3 {
     let mut chassis = default_chassis();
     // Spawned in the same bundle as `ConnectedClient` by the renet backend
     // (see bevy_replicon_renet's server.rs), so it's already present here.
@@ -242,9 +249,11 @@ fn spawn_car_on_connect(
     // predicted car already matches what the server assigns, no pop.
     chassis.color_seed = network_id as u32;
 
-    let index = registry.assign(client_entity);
-    let spawn_true = pick_spawn_point(index, &mut anchor, &noise, &origin);
-    let ground_y = height_at(&noise, spawn_true.x, spawn_true.z);
+    let index = registry
+        .index_for(client_entity)
+        .unwrap_or_else(|| panic!("client `{client_entity}` logged in without ever connecting"));
+    let spawn_true = pick_spawn_point(index, anchor, noise, origin);
+    let ground_y = height_at(noise, spawn_true.x, spawn_true.z);
     let local_spawn = (spawn_true - origin.offset).as_vec3();
 
     commands.spawn((
@@ -264,10 +273,7 @@ fn spawn_car_on_connect(
         CarSnapshot::default(),
         (
             Health::full(DEFAULT_MAX_HEALTH),
-            // Real value follows shortly via economy.rs's sync_wallet_components
-            // once IdentifyMsg/the loaded wallet arrives — 0/0 in the
-            // meantime is honest (this connection hasn't identified yet).
-            Wallet::default(),
+            wallet,
             LastFired::default(),
             OwnedBy(client_entity),
             Replicated,
@@ -299,6 +305,7 @@ fn spawn_car_on_connect(
     }
 
     info!("server: spawned car for client `{client_entity}` (player #{index})");
+    spawn_true
 }
 
 fn despawn_car_on_disconnect(

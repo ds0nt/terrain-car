@@ -150,20 +150,41 @@ pub struct WorldRegenMsg {
     pub origin_z: f64,
 }
 
-/// Sent client -> server repeatedly (every couple of seconds — see client's
-/// `net.rs`) rather than exactly once, since there's no explicit "you are
-/// now connected" signal this game currently listens for and a single
-/// fire-at-Startup attempt could race the transport actually being ready.
-/// The server treats every receipt as idempotent (just records/overwrites
-/// the mapping — see `car_sim.rs`'s `PlayerIdentities`), so re-sending is
-/// harmless. `player_id` is a UUID generated once and saved to a local
-/// file on first launch (see `net.rs`'s `load_or_create_player_id`) rather
-/// than derived from anything connection-specific — it's the one piece of
-/// "who is this, across every future session" identity buildings/wallets
-/// (a later addition) key off, unlike `LocalCar`'s per-connection id.
-#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
-pub struct IdentifyMsg {
-    pub player_id: Uuid,
+/// Sent client -> server to create a new account. The server is the sole
+/// authority on both fields (`shared::auth`'s validators are run on both
+/// sides — client-side only for instant UI feedback, server-side because
+/// nothing client-supplied is ever trusted); on success the server
+/// generates a fresh `Uuid` for this account, hashes the password, and
+/// replies with `AuthResultMsg`. Replaces the old `IdentifyMsg`, which let
+/// any client simply *claim* a `player_id` with zero verification.
+#[derive(Event, Serialize, Deserialize, Clone, Debug)]
+pub struct RegisterMsg {
+    pub username: String,
+    pub password: String,
+}
+
+/// Sent client -> server to log into an existing account. Wrong username
+/// and wrong password both map to the same `AuthResultMsg` failure
+/// (`InvalidCredentials` — see `server::persistence::AuthOutcome`) so a
+/// failed attempt never reveals whether the username itself exists.
+#[derive(Event, Serialize, Deserialize, Clone, Debug)]
+pub struct LoginMsg {
+    pub username: String,
+    pub password: String,
+}
+
+/// Sent server -> the requesting client only (never broadcast — this is
+/// private to whoever sent the `RegisterMsg`/`LoginMsg`), in response to
+/// either. `player_id` is `Some` only when `ok` is true; the client stores
+/// it as its identity for the rest of this session — nothing is generated
+/// or trusted client-side anymore. `message` is a short human-readable
+/// reason on failure ("username taken", "invalid credentials", ...) shown
+/// directly in the login UI.
+#[derive(Event, Serialize, Deserialize, Clone, Debug)]
+pub struct AuthResultMsg {
+    pub ok: bool,
+    pub player_id: Option<Uuid>,
+    pub message: String,
 }
 
 /// Sent client -> server from the live tuning panel (`Tab`, see client's
@@ -340,7 +361,9 @@ pub fn register_protocol(app: &mut App) {
         .add_client_event::<FireGunMsg>(Channel::Unreliable)
         .add_server_event::<GunFiredMsg>(Channel::Unreliable)
         .add_client_event::<TuneCarMsg>(Channel::Ordered)
-        .add_client_event::<IdentifyMsg>(Channel::Ordered)
+        .add_client_event::<RegisterMsg>(Channel::Ordered)
+        .add_client_event::<LoginMsg>(Channel::Ordered)
+        .add_server_event::<AuthResultMsg>(Channel::Ordered)
         .replicate::<Wallet>()
         .replicate::<BuildingSnapshot>()
         .replicate::<VillagerSnapshot>()

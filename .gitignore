@@ -1,8 +1,9 @@
 /target
 /dist
-# Per-machine persistent player identity (client/src/net.rs) — generated
-# on first launch, never meant to be shared/committed.
-player_id.txt
+# Last-used username, cached locally purely to prefill the login form
+# (client/src/auth_ui.rs) — never the password, and not trust-bearing
+# (the server is always the actual authority on identity).
+last_username.txt
 # Real DB credentials for the server (see .env.example for the format) —
 # never committed. dotenvy loads this automatically at server startup.
 .env

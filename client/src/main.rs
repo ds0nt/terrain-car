@@ -1,3 +1,4 @@
+mod auth_ui;
 mod building_placement;
 mod building_render;
 mod building_ui;
@@ -77,6 +78,7 @@ fn main() {
             building_render::BuildingRenderPlugin,
             building_placement::BuildingPlacementPlugin,
             villager_render::VillagerRenderPlugin,
+            auth_ui::AuthUiPlugin,
         ));
 
     // Registers replicated components/events — must use the exact same

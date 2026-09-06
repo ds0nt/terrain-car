@@ -1,0 +1,131 @@
+use bevy::prelude::*;
+use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
+use bevy_replicon::prelude::ClientTriggerExt;
+use shared::auth::{validate_password, validate_username};
+use shared::protocol::{AuthResultMsg, LoginMsg, RegisterMsg};
+
+/// Real accounts, replacing the old "trust whatever UUID the client
+/// claims" identity — see `shared::protocol::RegisterMsg`/`LoginMsg`'s
+/// docs. Nothing spawns a *server-authoritative* car until `AuthState`
+/// reaches `LoggedIn` (the client's own locally-predicted car still
+/// appears immediately at `Startup`, same as always — see `car.rs`'s
+/// `spawn_car` docs on why that's left untouched; it just never merges
+/// with anything server-side until login succeeds).
+pub struct AuthUiPlugin;
+
+impl Plugin for AuthUiPlugin {
+    fn build(&self, app: &mut App) {
+        // Does *not* register `EguiPlugin` — `tuning_ui.rs` already does
+        // that once for the whole app; a second registration would panic.
+        app.init_resource::<AuthState>()
+            .init_resource::<LoginForm>()
+            .add_observer(apply_auth_result)
+            .add_systems(EguiPrimaryContextPass, draw_login_window);
+    }
+}
+
+/// Where the last-used username is cached purely to prefill the login
+/// form on relaunch — never the password, and never trusted for anything;
+/// the server is the sole authority on identity every single login.
+const LAST_USERNAME_PATH: &str = "last_username.txt";
+
+#[derive(Resource, Default)]
+pub enum AuthState {
+    #[default]
+    LoggedOut,
+    Pending,
+    LoggedIn,
+}
+
+#[derive(Resource)]
+struct LoginForm {
+    username: String,
+    password: String,
+    error: Option<String>,
+}
+
+impl Default for LoginForm {
+    fn default() -> Self {
+        let username = std::fs::read_to_string(LAST_USERNAME_PATH).unwrap_or_default();
+        Self { username: username.trim().to_string(), password: String::new(), error: None }
+    }
+}
+
+fn draw_login_window(
+    mut contexts: EguiContexts,
+    mut state: ResMut<AuthState>,
+    mut form: ResMut<LoginForm>,
+    mut commands: Commands,
+) -> Result {
+    if !matches!(*state, AuthState::LoggedOut | AuthState::Pending) {
+        return Ok(());
+    }
+    let pending = matches!(*state, AuthState::Pending);
+
+    egui::Window::new("Log In").collapsible(false).resizable(false).show(contexts.ctx_mut()?, |ui| {
+        ui.add_enabled_ui(!pending, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Username:");
+                ui.text_edit_singleline(&mut form.username);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Password:");
+                ui.add(egui::TextEdit::singleline(&mut form.password).password(true));
+            });
+
+            ui.horizontal(|ui| {
+                if ui.button("Log In").clicked() {
+                    try_submit(&mut state, &mut form, &mut commands, false);
+                }
+                if ui.button("Register").clicked() {
+                    try_submit(&mut state, &mut form, &mut commands, true);
+                }
+            });
+        });
+
+        if pending {
+            ui.label("...");
+        }
+        if let Some(error) = &form.error {
+            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), error);
+        }
+    });
+
+    Ok(())
+}
+
+fn try_submit(state: &mut AuthState, form: &mut LoginForm, commands: &mut Commands, is_register: bool) {
+    if let Err(reason) = validate_username(&form.username) {
+        form.error = Some(reason.to_string());
+        return;
+    }
+    if let Err(reason) = validate_password(&form.password) {
+        form.error = Some(reason.to_string());
+        return;
+    }
+    form.error = None;
+    let _ = std::fs::write(LAST_USERNAME_PATH, &form.username);
+    if is_register {
+        commands.client_trigger(RegisterMsg {
+            username: form.username.clone(),
+            password: form.password.clone(),
+        });
+    } else {
+        commands
+            .client_trigger(LoginMsg { username: form.username.clone(), password: form.password.clone() });
+    }
+    *state = AuthState::Pending;
+}
+
+fn apply_auth_result(result: On<AuthResultMsg>, mut state: ResMut<AuthState>, mut form: ResMut<LoginForm>) {
+    if result.ok {
+        let player_id = result.player_id.expect("AuthResultMsg with ok=true always carries a player_id");
+        info!("client: logged in as `{player_id}`");
+        *state = AuthState::LoggedIn;
+        form.password.clear();
+    } else {
+        warn!("client: auth failed: {}", result.message);
+        form.error = Some(result.message.clone());
+        *state = AuthState::LoggedOut;
+    }
+}

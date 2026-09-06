@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use shared::buildings::BuildingKind;
 use shared::deposits::is_near_deposit;
-use shared::protocol::{BuildingSnapshot, IdentifyMsg, VillagerSnapshot};
+use shared::protocol::{BuildingSnapshot, VillagerSnapshot};
 use shared::time::now_unix;
 use shared::worldspace::WorldOrigin;
 
@@ -33,7 +33,6 @@ impl Plugin for VillagersPlugin {
             LAND_FACTORY_INTERVAL_SECS,
             TimerMode::Repeating,
         )))
-        .add_observer(spawn_villager_on_identify)
         .add_systems(Update, (wander_villagers, gather_resources, spawn_from_land_factories));
     }
 }
@@ -55,7 +54,7 @@ const LAND_FACTORY_INTERVAL_SECS: f32 = 60.0;
 const MAX_VILLAGERS_PER_PLAYER: usize = 5;
 
 #[derive(Component)]
-struct VillagerAi {
+pub(crate) struct VillagerAi {
     owner_player_id: Uuid,
     target_true_x: f64,
     target_true_z: f64,
@@ -81,29 +80,24 @@ fn spawn_villager(commands: &mut Commands, owner_player_id: Uuid, true_x: f64, t
     ));
 }
 
-/// Spawns exactly one villager per player, the first time they're
-/// identified. Idempotent by checking for an existing `VillagerAi` with
-/// this `player_id` rather than a separate "already seeded" set — the
-/// same reasoning applies once villagers persist across restarts as it
-/// does for `seed_wallet_on_identify`'s wallet check.
-fn spawn_villager_on_identify(
-    identify: On<FromClient<IdentifyMsg>>,
-    mut commands: Commands,
-    origin: Res<WorldOrigin>,
-    cars: Query<(&OwnedBy, &Transform)>,
-    existing: Query<&VillagerAi>,
+/// Spawns exactly one villager per player, the first time they ever log
+/// in — called directly from `server::auth`'s login/register success
+/// handler (which already knows exactly where their car just spawned, so
+/// no separate lookup is needed), rather than reacting to a network
+/// message of its own. Idempotent by checking for an existing
+/// `VillagerAi` with this `player_id`: a returning player logging in
+/// again on a later session must not get a second one.
+pub(crate) fn spawn_villager_for_new_player(
+    commands: &mut Commands,
+    existing: &Query<&VillagerAi>,
+    owner_player_id: Uuid,
+    true_x: f64,
+    true_z: f64,
 ) {
-    if existing.iter().any(|v| v.owner_player_id == identify.player_id) {
+    if existing.iter().any(|v| v.owner_player_id == owner_player_id) {
         return;
     }
-    let Some(client_entity) = identify.client_id.entity() else {
-        return;
-    };
-    let Some((_, car_transform)) = cars.iter().find(|(owner, _)| owner.0 == client_entity) else {
-        return;
-    };
-    let true_pos = origin.to_true(car_transform.translation);
-    spawn_villager(&mut commands, identify.player_id, true_pos.x, true_pos.z);
+    spawn_villager(commands, owner_player_id, true_x, true_z);
 }
 
 /// Every `LAND_FACTORY_INTERVAL_SECS`, each completed Land Factory spawns

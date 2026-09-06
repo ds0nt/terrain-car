@@ -1,7 +1,7 @@
 use bevy::math::DVec3;
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::{Collider, Friction, RigidBody};
-use shared::buildings::{self, BuildingKind};
+use shared::buildings::{self, BuildingKind, ColliderShape};
 use shared::protocol::BuildingSnapshot;
 use shared::time::now_unix;
 
@@ -51,22 +51,26 @@ pub(crate) fn building_mesh_and_transform(
         );
     }
 
-    let (mesh, base_color, half_height) = match kind {
-        BuildingKind::Hangar => {
-            (meshes.add(Cuboid::new(4.0, 2.5, 5.0)), Color::srgb(0.45, 0.45, 0.5), 1.25)
+    // Cuboid/Cylinder dimensions and the collider used to actually block a
+    // car (see `init_building_visuals`) come from the exact same
+    // `collider_shape` per kind — mesh and collider can never drift apart.
+    let shape = buildings::collider_shape(kind);
+    let mesh = match shape {
+        ColliderShape::Cuboid { half_x, half_y, half_z } => {
+            meshes.add(Cuboid::new(half_x * 2.0, half_y * 2.0, half_z * 2.0))
         }
-        BuildingKind::EnergyGenerator => {
-            (meshes.add(Cylinder::new(1.2, 3.0)), Color::srgb(0.9, 0.8, 0.2), 1.5)
+        ColliderShape::Cylinder { half_height, radius } => {
+            meshes.add(Cylinder::new(radius, half_height * 2.0))
         }
-        BuildingKind::ExtractionFacility => {
-            (meshes.add(Cylinder::new(0.8, 4.0)), Color::srgb(0.75, 0.4, 0.2), 2.0)
-        }
-        BuildingKind::LandFactory => {
-            (meshes.add(Cuboid::new(6.0, 3.5, 6.0)), Color::srgb(0.3, 0.35, 0.32), 1.75)
-        }
+    };
+    let base_color = match kind {
+        BuildingKind::Hangar => Color::srgb(0.45, 0.45, 0.5),
+        BuildingKind::EnergyGenerator => Color::srgb(0.9, 0.8, 0.2),
+        BuildingKind::ExtractionFacility => Color::srgb(0.75, 0.4, 0.2),
+        BuildingKind::LandFactory => Color::srgb(0.3, 0.35, 0.32),
         BuildingKind::Ramp => unreachable!("handled above"),
     };
-    let transform = Transform::from_xyz(local_x, ground_y + half_height, local_z)
+    let transform = Transform::from_xyz(local_x, ground_y + shape.half_height(), local_z)
         .with_rotation(Quat::from_rotation_y(rotation_y));
     (mesh, base_color, transform)
 }
@@ -108,11 +112,12 @@ fn init_building_visuals(
         transform,
     ));
 
-    // Ramp is a real physics object (a car needs to drive on it) — the
-    // exact same collider dimensions/pose the server uses for its own
-    // copy, so client-side prediction and server-authoritative physics
-    // can never disagree about where the surface is. Every other kind
-    // here is purely decorative (no collider at all).
+    // Every building is a real physics object now — the exact same
+    // collider dimensions/pose the server uses for its own copy (`Ramp`
+    // via `RAMP_HALF_*`/`ramp_transform`, everything else via
+    // `collider_shape`, both shared with `economy.rs`), so client-side
+    // prediction and server-authoritative physics can never disagree
+    // about where a car is actually blocked.
     if snapshot.kind == BuildingKind::Ramp {
         entity.insert((
             RigidBody::Fixed,
@@ -123,6 +128,12 @@ fn init_building_visuals(
             ),
             Friction::coefficient(1.0),
         ));
+    } else {
+        let collider = match buildings::collider_shape(snapshot.kind) {
+            ColliderShape::Cuboid { half_x, half_y, half_z } => Collider::cuboid(half_x, half_y, half_z),
+            ColliderShape::Cylinder { half_height, radius } => Collider::cylinder(half_height, radius),
+        };
+        entity.insert((RigidBody::Fixed, collider, Friction::coefficient(1.0)));
     }
 }
 

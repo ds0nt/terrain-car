@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod buildings;
 pub mod car_physics;
 mod chunk_rng;

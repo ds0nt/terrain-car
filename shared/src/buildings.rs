@@ -35,6 +35,42 @@ pub fn ramp_transform(local_x: f32, local_z: f32, ground_y: f32, rotation_y: f32
     (translation, rotation)
 }
 
+/// A solid collider shape for a non-`Ramp` building — every kind blocks a
+/// car now, not just `Ramp` (which uses its own tilted `ramp_transform`
+/// path instead and never calls this). Shared by client
+/// (`building_render.rs`) and server (`economy.rs`) so mesh and collider
+/// dimensions can never drift apart, the same reasoning `RAMP_HALF_WIDTH`
+/// etc. already follow.
+pub enum ColliderShape {
+    Cuboid { half_x: f32, half_y: f32, half_z: f32 },
+    Cylinder { half_height: f32, radius: f32 },
+}
+
+impl ColliderShape {
+    /// Half-height above `ground_y` the entity's own transform origin
+    /// should sit at — every shape here is upright and vertically
+    /// centered, so this is just its own half-extent along Y.
+    pub fn half_height(&self) -> f32 {
+        match *self {
+            ColliderShape::Cuboid { half_y, .. } => half_y,
+            ColliderShape::Cylinder { half_height, .. } => half_height,
+        }
+    }
+}
+
+/// Extents matching each kind's existing render mesh exactly (see
+/// `client::building_render::building_mesh_and_transform`) — `Ramp` isn't
+/// covered here, it has its own dedicated tilted geometry.
+pub fn collider_shape(kind: BuildingKind) -> ColliderShape {
+    match kind {
+        BuildingKind::Hangar => ColliderShape::Cuboid { half_x: 2.0, half_y: 1.25, half_z: 2.5 },
+        BuildingKind::EnergyGenerator => ColliderShape::Cylinder { half_height: 1.5, radius: 1.2 },
+        BuildingKind::ExtractionFacility => ColliderShape::Cylinder { half_height: 2.0, radius: 0.8 },
+        BuildingKind::LandFactory => ColliderShape::Cuboid { half_x: 3.0, half_y: 1.75, half_z: 3.0 },
+        BuildingKind::Ramp => unreachable!("Ramp uses ramp_transform, never collider_shape"),
+    }
+}
+
 /// Every new player's wallet starts here — enough to afford at least one
 /// of any single building outright, so the very first building is
 /// actually placeable (nothing produces resources until a building

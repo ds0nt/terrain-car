@@ -8,9 +8,7 @@ use uuid::Uuid;
 
 use shared::buildings::{BuildingKind, STARTING_ENERGY, STARTING_ORE};
 use shared::deposits::is_near_deposit;
-use shared::protocol::{
-    BuildingSnapshot, CarSnapshot, IdentifyMsg, PlaceBuildingMsg, RecallToHangarMsg, Wallet,
-};
+use shared::protocol::{BuildingSnapshot, CarSnapshot, PlaceBuildingMsg, RecallToHangarMsg, Wallet};
 use shared::terrain_gen::{height_at, TerrainNoise};
 use shared::worldspace::WorldOrigin;
 
@@ -37,7 +35,6 @@ impl Plugin for EconomyPlugin {
                 PRODUCTION_TICK_SECS,
                 TimerMode::Repeating,
             )))
-            .add_observer(seed_wallet_on_identify)
             .add_observer(apply_place_building)
             .add_observer(apply_recall_to_hangar)
             .add_systems(Update, (apply_loaded_state, tick_production, sync_wallet_components));
@@ -54,7 +51,11 @@ impl Plugin for EconomyPlugin {
 pub struct Wallets(HashMap<Uuid, (f32, f32)>);
 
 impl Wallets {
-    fn get_or_seed(&mut self, player_id: Uuid) -> (f32, f32) {
+    /// `pub(crate)`: `server::auth` calls this once, right after a
+    /// successful login/register, to learn the wallet a just-spawned car
+    /// should start with — see that module's docs on why this replaced
+    /// the old `seed_wallet_on_identify`.
+    pub(crate) fn get_or_seed(&mut self, player_id: Uuid) -> (f32, f32) {
         *self.0.entry(player_id).or_insert((STARTING_ENERGY, STARTING_ORE))
     }
 
@@ -99,28 +100,6 @@ impl Wallets {
 #[derive(Resource)]
 struct ProductionTimer(Timer);
 
-/// Gives a brand-new player their starting wallet the moment they're
-/// first identified — nothing else would ever seed one otherwise (no
-/// production without a building, no building without funds to place it).
-/// A player already known (either from a previous `IdentifyMsg` this
-/// session, or loaded from Postgres at startup — see `apply_loaded_state`)
-/// is left untouched.
-fn seed_wallet_on_identify(
-    identify: On<FromClient<IdentifyMsg>>,
-    mut wallets: ResMut<Wallets>,
-    persistence: Res<Persistence>,
-) {
-    if wallets.0.contains_key(&identify.player_id) {
-        return;
-    }
-    let (energy, ore) = wallets.get_or_seed(identify.player_id);
-    persistence.send(PersistenceCommand::SaveWallet(WalletRow {
-        player_id: identify.player_id,
-        energy: energy as f64,
-        ore: ore as f64,
-    }));
-}
-
 /// Applies whatever the persistence thread has loaded (in practice: once,
 /// shortly after server startup) into the live in-memory `Wallets` map and
 /// spawns a replicated `BuildingSnapshot` per loaded building. The sole
@@ -131,6 +110,7 @@ fn apply_loaded_state(
     persistence: Res<Persistence>,
     mut wallets: ResMut<Wallets>,
     origin: Res<WorldOrigin>,
+    mut auth_events: MessageWriter<crate::auth::AuthOutcomeReceived>,
 ) {
     while let Some(event) = persistence.try_recv() {
         match event {
@@ -148,6 +128,13 @@ fn apply_loaded_state(
             }
             PersistenceEvent::Unavailable => {
                 warn!("economy: running without a database — wallets/buildings will not persist");
+            }
+            // Not this module's concern — forwarded as a plain Bevy
+            // message so `server::auth` can react without also polling
+            // `persistence.try_recv()` itself (see that module's docs on
+            // why only one system may ever drain this channel).
+            PersistenceEvent::AuthResult { client_entity, outcome } => {
+                auth_events.write(crate::auth::AuthOutcomeReceived { client_entity, outcome });
             }
         }
     }
@@ -182,8 +169,8 @@ fn spawn_building(
         Replicated,
     ));
 
+    let local = (bevy::math::DVec3::new(true_x, 0.0, true_z) - origin.offset).as_vec3();
     if kind.is_drivable_structure() {
-        let local = (bevy::math::DVec3::new(true_x, 0.0, true_z) - origin.offset).as_vec3();
         let (translation, rotation) =
             shared::buildings::ramp_transform(local.x, local.z, ground_y, rotation_y);
         entity.insert((
@@ -194,6 +181,27 @@ fn spawn_building(
                 shared::buildings::RAMP_HALF_THICKNESS,
                 shared::buildings::RAMP_HALF_LENGTH,
             ),
+            Friction::coefficient(1.0),
+        ));
+    } else {
+        // Every other kind is a solid, upright obstacle — same shape and
+        // Y-offset the client uses for its own copy (see
+        // `client::building_render::building_mesh_and_transform`), so a
+        // car is blocked identically on both sides.
+        let shape = shared::buildings::collider_shape(kind);
+        let collider = match shape {
+            shared::buildings::ColliderShape::Cuboid { half_x, half_y, half_z } => {
+                Collider::cuboid(half_x, half_y, half_z)
+            }
+            shared::buildings::ColliderShape::Cylinder { half_height, radius } => {
+                Collider::cylinder(half_height, radius)
+            }
+        };
+        entity.insert((
+            Transform::from_xyz(local.x, ground_y + shape.half_height(), local.z)
+                .with_rotation(Quat::from_rotation_y(rotation_y)),
+            RigidBody::Fixed,
+            collider,
             Friction::coefficient(1.0),
         ));
     }
