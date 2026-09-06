@@ -3,3 +3,6 @@
 # Per-machine persistent player identity (client/src/net.rs) — generated
 # on first launch, never meant to be shared/committed.
 player_id.txt
+# Real DB credentials for the server (see .env.example for the format) —
+# never committed. dotenvy loads this automatically at server startup.
+.env

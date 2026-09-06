@@ -5908,6 +5908,7 @@ dependencies = [
  "bevy_rapier3d",
  "bevy_replicon",
  "bevy_replicon_renet",
+ "dotenvy",
  "rand 0.8.8",
  "shared",
  "sqlx",

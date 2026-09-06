@@ -30,3 +30,4 @@ uuid = { version = "1.26.0", features = ["serde"] }
 # too — this server only ever talks to Postgres (Supabase).
 sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "migrate", "macros", "uuid"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
+dotenvy = "0.15.7"

@@ -20,6 +20,16 @@ use bevy_replicon::prelude::*;
 use shared::protocol::register_protocol;
 
 fn main() {
+    // Loads `.env` (workspace-root-relative, matching how this binary is
+    // normally run — `cargo run -p server` / `./target/debug/
+    // terrain_car_server` from the repo root) into the process environment
+    // before anything reads `SUPABASE_DB_URL`. Silently does nothing if no
+    // `.env` exists (e.g. a real deployment setting the env var directly)
+    // — `persistence.rs` already logs its own clear warning if the
+    // variable ends up unset either way, so there's nothing useful to add
+    // here before `LogPlugin` even exists yet to log through.
+    dotenvy::dotenv().ok();
+
     let mut app = App::new();
 
     // `TimestepMode` must be set before `RapierPhysicsPlugin` (which only

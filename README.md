@@ -36,6 +36,8 @@ Environment variables:
 - `TERRAIN_CAR_RECORD_ROOT` — session recorder output directory
 - `SUPABASE_DB_URL` — Postgres connection string (`postgresql://postgres:PASSWORD@db.PROJECT.supabase.co:5432/postgres`) for the server's persistence layer (base-building state — see `server/src/persistence.rs`). URL-encode special characters in the password (e.g. `@` → `%40`, `!` → `%21`). Optional: without it, the server runs normally, just without anything persisting.
 
+  The server loads a `.env` file from the current directory automatically (via `dotenvy`) — copy `.env.example` to `.env` and fill in your own connection string rather than exporting it by hand every time. `.env` is gitignored; only `.env.example` (no real credentials) is committed.
+
 ## Controls
 
 | Key | Action |
