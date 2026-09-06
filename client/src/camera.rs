@@ -1,5 +1,6 @@
 use bevy::camera::{Exposure, Hdr};
 use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::input::mouse::MouseMotion;
 use bevy::light::AtmosphereEnvironmentMapLight;
 use bevy::pbr::AtmosphereSettings;
 use bevy::post_process::bloom::Bloom;
@@ -14,14 +15,58 @@ const CAMERA_CLIP_MARGIN: f32 = 0.4;
 /// Never pull the chase camera closer than this even if something is right
 /// behind the car — a camera glued to the bumper is worse than brief clipping.
 const CAMERA_MIN_DISTANCE: f32 = 1.5;
+/// How far the free-look camera orbits from — matches Chase's own distance
+/// (the `9.0`/`4.0` in its `desired` computation) so looking around doesn't
+/// also change how big the car reads on screen.
+const ORBIT_DISTANCE: f32 = 9.8;
+const ORBIT_SENSITIVITY: f32 = 0.006;
+/// Just short of straight up/down — orbiting exactly to the pole would
+/// otherwise let yaw spin freely with no visual reference (gimbal-lock
+/// territory), which reads as the camera flipping.
+const ORBIT_PITCH_LIMIT: f32 = 1.45;
 
 pub struct CameraPlugin;
 
 impl Plugin for CameraPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CameraMode>()
+            .init_resource::<OrbitLook>()
             .add_systems(Startup, spawn_camera)
-            .add_systems(Update, (toggle_camera_mode, update_camera).chain());
+            .add_systems(Update, (toggle_camera_mode, handle_orbit_input, update_camera).chain());
+    }
+}
+
+/// Free-look state: held while `MouseButton::Middle` is down (fully unused
+/// anywhere else in this game — Left is claimed by selection/placement and
+/// Right by placement-cancel, both state-gated, so Middle is the one
+/// binding with zero chance of colliding with either). `yaw`/`pitch`
+/// persist across holds rather than resetting each time, so releasing and
+/// grabbing the view again doesn't snap back to "directly behind the car"
+/// — it picks up roughly where you left it.
+#[derive(Resource, Default)]
+struct OrbitLook {
+    active: bool,
+    yaw: f32,
+    pitch: f32,
+}
+
+fn handle_orbit_input(
+    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    mut motion: MessageReader<MouseMotion>,
+    mut orbit: ResMut<OrbitLook>,
+) {
+    orbit.active = mouse_buttons.pressed(MouseButton::Middle);
+    if !orbit.active {
+        // Still drain the reader so a burst of motion while not orbiting
+        // (e.g. moving the mouse before ever middle-clicking) doesn't
+        // apply itself all at once the instant orbiting starts.
+        motion.clear();
+        return;
+    }
+    for event in motion.read() {
+        orbit.yaw -= event.delta.x * ORBIT_SENSITIVITY;
+        orbit.pitch = (orbit.pitch - event.delta.y * ORBIT_SENSITIVITY)
+            .clamp(-ORBIT_PITCH_LIMIT, ORBIT_PITCH_LIMIT);
     }
 }
 
@@ -63,9 +108,42 @@ fn toggle_camera_mode(keyboard: Res<ButtonInput<KeyCode>>, mut mode: ResMut<Came
     }
 }
 
+/// Pulls `desired` in front of whatever it would otherwise clip into,
+/// looking back from `look_target` — shared by Chase and free-look, since
+/// both are "camera sits some distance from a point, terrain might be in
+/// the way" the same way.
+fn avoid_clipping(
+    rapier_context: &ReadRapierContext,
+    exclude: Entity,
+    look_target: Vec3,
+    desired: Vec3,
+) -> Vec3 {
+    let Ok(context) = rapier_context.single() else {
+        return desired;
+    };
+    let offset = desired - look_target;
+    let distance = offset.length();
+    if distance <= 0.01 {
+        return desired;
+    }
+    let Some((_, toi)) = context.cast_ray(
+        look_target,
+        offset / distance,
+        distance,
+        true,
+        QueryFilter::new().exclude_rigid_body(exclude),
+    ) else {
+        return desired;
+    };
+    let clamped = (toi - CAMERA_CLIP_MARGIN).max(CAMERA_MIN_DISTANCE);
+    look_target + (offset / distance) * clamped
+}
+
+#[allow(clippy::too_many_arguments)]
 fn update_camera(
     time: Res<Time>,
     mode: Res<CameraMode>,
+    orbit: Res<OrbitLook>,
     rapier_context: ReadRapierContext,
     chassis_q: Query<(Entity, &GlobalTransform, &CarChassis), With<LocalCar>>,
     mut camera_q: Query<&mut Transform, With<CarCamera>>,
@@ -84,31 +162,42 @@ fn update_camera(
     // the map over the next second.
     let just_reset = reset_events.read().next().is_some();
 
+    // Free-look overrides whichever `CameraMode` is active while the
+    // button's held — it's a temporary "let me look around" gesture, not
+    // a third persistent mode you toggle into. Releasing it just lets the
+    // match below take over again next frame, lerping back into place
+    // exactly like recovering from any other momentary camera excursion.
+    if orbit.active {
+        let look_target = chassis_transform.translation + Vec3::Y * 1.0;
+        let orbit_rotation = Quat::from_euler(EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
+        let desired = avoid_clipping(
+            &rapier_context,
+            chassis_entity,
+            look_target,
+            look_target + orbit_rotation * Vec3::new(0.0, 0.0, ORBIT_DISTANCE),
+        );
+
+        // Snappier than the chase lerp on purpose — a free-look camera
+        // that laggily eases toward where you just aimed the mouse feels
+        // unresponsive, not cinematic.
+        let lerp_factor = if just_reset { 1.0 } else { 1.0 - (-16.0 * dt).exp() };
+        camera_tf.translation = camera_tf.translation.lerp(desired, lerp_factor);
+        let target_rotation =
+            Transform::from_translation(camera_tf.translation).looking_at(look_target, Vec3::Y).rotation;
+        camera_tf.rotation = camera_tf.rotation.slerp(target_rotation, lerp_factor);
+        return;
+    }
+
     match *mode {
         CameraMode::Chase => {
             let look_target = chassis_transform.translation + Vec3::Y * 1.0;
-            let mut desired = chassis_transform.translation - *chassis_transform.forward() * 9.0
+            let desired = chassis_transform.translation - *chassis_transform.forward() * 9.0
                 + Vec3::Y * 4.0;
 
             // Terrain here can be steep enough that a fixed chase distance
             // regularly ends up inside a cliff face — pull the camera in
             // front of whatever it would clip into instead.
-            if let Ok(context) = rapier_context.single() {
-                let offset = desired - look_target;
-                let distance = offset.length();
-                if distance > 0.01
-                    && let Some((_, toi)) = context.cast_ray(
-                        look_target,
-                        offset / distance,
-                        distance,
-                        true,
-                        QueryFilter::new().exclude_rigid_body(chassis_entity),
-                    )
-                {
-                    let clamped = (toi - CAMERA_CLIP_MARGIN).max(CAMERA_MIN_DISTANCE);
-                    desired = look_target + (offset / distance) * clamped;
-                }
-            }
+            let desired = avoid_clipping(&rapier_context, chassis_entity, look_target, desired);
 
             let lerp_factor = if just_reset { 1.0 } else { 1.0 - (-6.0 * dt).exp() };
             camera_tf.translation = camera_tf.translation.lerp(desired, lerp_factor);
