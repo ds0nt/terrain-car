@@ -2,7 +2,6 @@ use bevy::prelude::*;
 use bevy_rapier3d::prelude::Velocity;
 
 use shared::combat::Health;
-use shared::deposits::{is_near_deposit, nearest_deposit_within};
 use shared::protocol::Wallet;
 use shared::terrain_gen::{biome_label, TerrainNoise};
 
@@ -32,19 +31,8 @@ enum HudField {
     GForce,
     Health,
     Wallet,
-    Deposit,
     Rec,
 }
-
-/// How far out to search for the nearest deposit — generous enough to
-/// almost always find one (deposits are sparse but not *that* sparse; see
-/// `shared::deposits::nearest_deposit_within`'s own tests), while staying
-/// cheap: at 4Hz this refresh runs, ~40x40 chunk checks is a handful of
-/// scalar hashes each, nowhere near enough work to matter.
-const DEPOSIT_SEARCH_RADIUS_CHUNKS: i64 = 40;
-/// How often the deposit search re-runs — informational only, doesn't need
-/// per-frame freshness, and it's the priciest thing this HUD computes.
-const DEPOSIT_REFRESH_HZ: f32 = 4.0;
 
 fn hud_text_style() -> (TextFont, TextColor) {
     (
@@ -78,7 +66,6 @@ fn spawn_hud(mut commands: Commands) {
             parent.spawn((Text::new("G      1.00"), font.clone(), color, HudField::GForce));
             parent.spawn((Text::new("HEALTH 100%"), font.clone(), color, HudField::Health));
             parent.spawn((Text::new("ENERGY 0  ORE 0"), font.clone(), color, HudField::Wallet));
-            parent.spawn((Text::new("ORE DEPOSIT  ---"), font.clone(), color, HudField::Deposit));
             parent.spawn((
                 Text::new(""),
                 font,
@@ -95,8 +82,6 @@ fn update_hud(
     recording: Res<RecordingActive>,
     chassis_q: Query<(&GlobalTransform, &Velocity, &Health, &Wallet), With<LocalCar>>,
     mut prev_vertical_speed: Local<f32>,
-    mut deposit_refresh: Local<f32>,
-    mut deposit_text: Local<String>,
     mut fields_q: Query<(&mut Text, &HudField)>,
 ) {
     let Ok((chassis_gt, velocity, health, wallet)) = chassis_q.single() else {
@@ -109,23 +94,6 @@ fn update_hud(
 
     let true_pos = origin.to_true(chassis_gt.translation());
     let world_type = biome_label(&noise, true_pos.x, true_pos.z);
-
-    *deposit_refresh -= dt;
-    if *deposit_refresh <= 0.0 {
-        *deposit_refresh = 1.0 / DEPOSIT_REFRESH_HZ;
-        *deposit_text = if is_near_deposit(true_pos.x, true_pos.z) {
-            "ORE DEPOSIT  HERE — build an Extraction Facility!".to_string()
-        } else {
-            match nearest_deposit_within(true_pos.x, true_pos.z, DEPOSIT_SEARCH_RADIUS_CHUNKS) {
-                Some(deposit) => {
-                    let dx = deposit.true_x - true_pos.x;
-                    let dz = deposit.true_z - true_pos.z;
-                    format!("ORE DEPOSIT  {:.0}m away", (dx * dx + dz * dz).sqrt())
-                }
-                None => "ORE DEPOSIT  none found nearby".to_string(),
-            }
-        };
-    }
 
     // A g-meter: net vertical acceleration including gravity, the same
     // quantity an accelerometer would read. Sits at 1.00 at rest (ground
@@ -151,7 +119,6 @@ fn update_hud(
             HudField::Wallet => {
                 format!("ENERGY {:>4.0}  ORE {:>4.0}", wallet.energy, wallet.ore)
             }
-            HudField::Deposit => deposit_text.clone(),
             HudField::Rec => {
                 if recording.0 {
                     "REC  ●".to_string()

@@ -6,6 +6,7 @@ mod net;
 mod persistence;
 mod physics_fx;
 mod terrain_phys;
+mod villagers;
 mod weapons;
 
 use std::time::Duration;
@@ -57,6 +58,7 @@ fn main() {
         lightning::LightningPlugin,
         weapons::WeaponsPlugin,
         economy::EconomyPlugin,
+        villagers::VillagersPlugin,
     ));
 
     // Registers replicated components/events — must use the exact same

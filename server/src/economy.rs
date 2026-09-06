@@ -78,6 +78,15 @@ impl Wallets {
     /// between combat and the economy, not accidental scope creep: shoot
     /// another player, take a cut of their ore. Returns the amount
     /// actually transferred (0 if `from` had none).
+    /// Adds (or subtracts, for a negative delta) to a player's balance
+    /// directly — used by passive income sources (villagers' gathering,
+    /// `villagers.rs`) that aren't a transfer between two players the way
+    /// `steal_ore` is.
+    pub fn credit(&mut self, player_id: Uuid, energy_delta: f32, ore_delta: f32) {
+        let (energy, ore) = self.get_or_seed(player_id);
+        self.0.insert(player_id, (energy + energy_delta, ore + ore_delta));
+    }
+
     pub fn steal_ore(&mut self, from: Uuid, to: Uuid, amount: f32) -> f32 {
         // get_or_seed returns a copy, not a live reference — mutate via
         // insert(), same read-compute-write-back shape every other wallet

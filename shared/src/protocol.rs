@@ -232,6 +232,21 @@ pub struct Wallet {
     pub ore: f32,
 }
 
+/// A player's own free resource-gathering helper — spawned automatically
+/// the moment they're first identified, independent of any building, so
+/// there's always *some* way to recover energy/ore even starting from a
+/// wallet of zero (see `server::villagers`). "Glowing orb" is a
+/// deliberate v1 placeholder visual (the user's own words) — purely
+/// `client::villager_render`'s concern, nothing about this component
+/// implies a particular look. Continuously replicated: `true_x`/`true_z`
+/// update every server tick as it wanders, same as `CarSnapshot`.
+#[derive(Component, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct VillagerSnapshot {
+    pub owner_player_id: Uuid,
+    pub true_x: f64,
+    pub true_z: f64,
+}
+
 /// Sent client -> server to place a building. `true_x`/`true_z` is where
 /// the player wants it (their car's current position — see client's
 /// `building_ui.rs`); the server is the sole authority on whether it's
@@ -297,6 +312,7 @@ pub fn register_protocol(app: &mut App) {
         .add_client_event::<IdentifyMsg>(Channel::Ordered)
         .replicate::<Wallet>()
         .replicate::<BuildingSnapshot>()
+        .replicate::<VillagerSnapshot>()
         .add_client_event::<PlaceBuildingMsg>(Channel::Ordered)
         .add_client_event::<RecallToHangarMsg>(Channel::Ordered)
         .add_server_event::<WorldRegenMsg>(Channel::Ordered)

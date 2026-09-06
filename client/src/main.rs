@@ -15,6 +15,7 @@ mod tectonic;
 mod terrain;
 mod terrain_material;
 mod tuning_ui;
+mod villager_render;
 mod weapon_fx;
 mod worldspace;
 
@@ -73,6 +74,7 @@ fn main() {
             tuning_ui::TuningUiPlugin,
             building_ui::BuildingUiPlugin,
             building_render::BuildingRenderPlugin,
+            villager_render::VillagerRenderPlugin,
         ));
 
     // Registers replicated components/events — must use the exact same

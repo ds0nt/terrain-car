@@ -6,6 +6,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
 use bevy_rapier3d::prelude::*;
 use bevy_replicon::prelude::ClientTriggerExt;
+use shared::deposits::deposit_for_chunk;
 use shared::obstacles::{obstacles_for_chunk, ObstacleKind};
 use shared::protocol::{RegenRequestMsg, WorldRegenMsg};
 use shared::terrain_gen::{
@@ -165,6 +166,7 @@ fn spawn_chunk(
         coord.1 as f64 * CHUNK_SIZE as f64,
     );
     let obstacles = obstacles_for_chunk(noise, coord);
+    let deposit = deposit_for_chunk(coord);
 
     commands
         .spawn((
@@ -249,6 +251,39 @@ fn spawn_chunk(
                             });
                     }
                 }
+            }
+
+            // A visible in-world beacon at a deposit — purely cosmetic
+            // (no collider, cars drive straight through it), replacing an
+            // earlier text-only "Xm away" HUD hint with something you can
+            // actually see and drive toward while exploring. Streams
+            // in/out with the chunk exactly like obstacles, for the same
+            // "pure function of chunk coord, never replicated" reason.
+            if let Some(spec) = deposit {
+                let local_x = (spec.true_x - true_center.x) as f32;
+                let local_z = (spec.true_z - true_center.z) as f32;
+                let ground_y = height_at(noise, spec.true_x, spec.true_z);
+                const BEACON_HEIGHT: f32 = 18.0;
+                const BEACON_COLOR: Color = Color::srgb(1.0, 0.75, 0.25);
+
+                parent.spawn((
+                    Mesh3d(meshes.add(Cylinder::new(0.35, BEACON_HEIGHT))),
+                    MeshMaterial3d(materials.add(StandardMaterial {
+                        base_color: BEACON_COLOR,
+                        emissive: LinearRgba::rgb(3.0, 2.0, 0.3),
+                        alpha_mode: AlphaMode::Blend,
+                        unlit: true,
+                        ..default()
+                    })),
+                    Transform::from_xyz(local_x, ground_y + BEACON_HEIGHT * 0.5, local_z),
+                    PointLight {
+                        color: BEACON_COLOR,
+                        intensity: 200_000.0,
+                        range: 40.0,
+                        shadow_maps_enabled: false,
+                        ..default()
+                    },
+                ));
             }
         })
         .id()
