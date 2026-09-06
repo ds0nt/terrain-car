@@ -358,6 +358,7 @@ fn apply_car_input(
                 throttle: input_msg.throttle,
                 steer: input_msg.steer,
                 brake: input_msg.brake,
+                boost: input_msg.boost,
             };
             state.last_applied_sequence = input_msg.sequence;
             break;
@@ -684,6 +685,7 @@ fn step_cars(
                         arm,
                         throttle: input.throttle,
                         brake: input.brake,
+                        boost: input.boost,
                     },
                 );
                 total_force += out.force;

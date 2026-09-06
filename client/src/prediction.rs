@@ -116,6 +116,7 @@ fn send_input(
         throttle: input.throttle,
         steer: input.steer,
         brake: input.brake,
+        boost: input.boost,
     });
 }
 

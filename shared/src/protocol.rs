@@ -68,6 +68,7 @@ pub struct CarInputMsg {
     pub throttle: f32,
     pub steer: f32,
     pub brake: bool,
+    pub boost: bool,
 }
 
 /// Sent client -> server when the player presses R to unstick their car.

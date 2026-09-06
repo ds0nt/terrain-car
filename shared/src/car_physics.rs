@@ -58,6 +58,7 @@ pub struct CarInput {
     pub throttle: f32,
     pub steer: f32,
     pub brake: bool,
+    pub boost: bool,
 }
 
 /// Server-side per-car input state — see `CarInput`'s docs for why this
@@ -82,6 +83,14 @@ pub const CAR_MASS: f32 = 1100.0;
 /// computed against.
 pub const CAR_LINEAR_DAMPING: f32 = 0.28;
 pub const CAR_ANGULAR_DAMPING: f32 = 3.5;
+/// Extra forward force while holding Shift and throttling (see
+/// `compute_wheel_forces`) — on top of `default_chassis`'s 22_000
+/// `engine_force`, this more than doubles total drive force during a
+/// boost. Terminal speed roughly doubles too by the same
+/// `force / (linear_damping * mass)` math `engine_force`'s own doc
+/// comment uses: (22_000 + 35_000) / (0.28 * 1100) =~ 185 m/s, versus
+/// ~71 m/s unboosted.
+pub const BOOST_FORCE: f32 = 35_000.0;
 
 /// The one set of tuning constants every car uses. Shared so the server's
 /// authoritative spawn and the client's locally-predicted spawn (see
@@ -170,6 +179,11 @@ pub struct WheelStepInput {
     pub arm: Vec3,
     pub throttle: f32,
     pub brake: bool,
+    /// Shift-key rocket boost — only has any effect while `throttle` is
+    /// also nonzero (it amplifies the drive force already being applied,
+    /// rather than acting as an independent thruster you could fire while
+    /// coasting or in neutral).
+    pub boost: bool,
 }
 
 pub struct WheelStepOutput {
@@ -201,6 +215,19 @@ pub fn compute_wheel_forces(chassis: &CarChassis, input: &WheelStepInput) -> Whe
         let drive_force = input.wheel_forward * (chassis.engine_force * 0.25 * input.throttle);
         force += drive_force;
         torque += input.arm.cross(drive_force);
+
+        if input.boost {
+            // A dramatic step up, not a nudge: BOOST_FORCE alone is more
+            // than 1.5x the base engine_force, so total drive force during
+            // a boost is upwards of double normal — rocket-engine, not
+            // "slightly faster." Unlimited-while-held (no fuel meter/
+            // cooldown/HUD readout) is the deliberate v1 scope here: Shift
+            // just always works while throttling, simplest possible
+            // version of the ask with no new replicated state needed.
+            let boost_force = input.wheel_forward * (BOOST_FORCE * 0.25 * input.throttle.signum());
+            force += boost_force;
+            torque += input.arm.cross(boost_force);
+        }
     } else if !input.brake {
         // Rolling resistance: without this, releasing the throttle left
         // nothing opposing forward motion except Rapier's generic
@@ -281,6 +308,7 @@ mod tests {
             arm: Vec3::ZERO,
             throttle: 0.0,
             brake: false,
+            boost: false,
         };
         let out = compute_wheel_forces(&chassis, &input);
         assert_eq!(out.force, Vec3::ZERO);
@@ -310,6 +338,7 @@ mod tests {
             arm: Vec3::ZERO, // isolate force from torque bookkeeping
             throttle: 0.0,
             brake: false,
+            boost: false,
         };
         let out = compute_wheel_forces(&chassis, &input);
 
@@ -330,5 +359,50 @@ mod tests {
         );
         // Sliding in +right should produce a corrective force in -right.
         assert!(lateral_component.dot(wheel_right) < 0.0);
+    }
+
+    fn throttling_input(throttle: f32, boost: bool) -> WheelStepInput {
+        WheelStepInput {
+            compression: 0.0,
+            closing_speed: 0.0,
+            point_velocity: Vec3::ZERO,
+            up: Vec3::Y,
+            wheel_forward: Vec3::NEG_Z,
+            wheel_right: Vec3::X,
+            arm: Vec3::ZERO,
+            throttle,
+            brake: false,
+            boost,
+        }
+    }
+
+    /// Boost is an amplifier on drive force, not an independent thruster —
+    /// with the throttle held, boosting must add real extra forward force
+    /// (specifically `BOOST_FORCE * 0.25`, matching how `drive_force`
+    /// itself is already scaled per wheel).
+    #[test]
+    fn boost_adds_extra_forward_force_when_throttling() {
+        let chassis = test_chassis();
+        let plain = compute_wheel_forces(&chassis, &throttling_input(1.0, false));
+        let boosted = compute_wheel_forces(&chassis, &throttling_input(1.0, true));
+
+        let expected_extra = BOOST_FORCE * 0.25;
+        let actual_extra = (boosted.force - plain.force).length();
+        assert!(
+            (actual_extra - expected_extra).abs() < 1e-2,
+            "boost should add exactly BOOST_FORCE * 0.25 of forward force: {actual_extra} vs {expected_extra}"
+        );
+    }
+
+    /// Boost must never fire on its own — holding Shift with no throttle
+    /// (coasting, or sitting still) should behave identically to not
+    /// holding it at all, same rolling-resistance-only path as normal.
+    #[test]
+    fn boost_has_no_effect_without_throttle() {
+        let chassis = test_chassis();
+        let plain = compute_wheel_forces(&chassis, &throttling_input(0.0, false));
+        let boosted = compute_wheel_forces(&chassis, &throttling_input(0.0, true));
+        assert_eq!(plain.force, boosted.force);
+        assert_eq!(plain.torque, boosted.torque);
     }
 }

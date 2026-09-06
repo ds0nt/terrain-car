@@ -67,6 +67,7 @@ fn read_car_input(keyboard: Res<ButtonInput<KeyCode>>, mut input: ResMut<CarInpu
     input.throttle = throttle;
     input.steer = steer;
     input.brake = keyboard.pressed(KeyCode::Space);
+    input.boost = keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
 }
 
 /// Spawns the physics body for the local player's own car — cosmetics
@@ -332,6 +333,7 @@ fn car_suspension_and_drive(
                         arm,
                         throttle: input.throttle,
                         brake: input.brake,
+                        boost: input.boost,
                     },
                 );
                 total_force += out.force;
