@@ -11,12 +11,14 @@ mod lighting;
 mod lightning_fx;
 mod minimap;
 mod net;
+mod owner_color;
+mod pings;
+mod players_ui;
 mod prediction;
 mod recorder;
 mod tectonic;
 mod terrain;
 mod terrain_material;
-mod tuning_ui;
 mod villager_render;
 mod weapon_fx;
 mod worldspace;
@@ -73,13 +75,13 @@ fn main() {
             lightning_fx::LightningFxPlugin,
             bevy_hanabi::HanabiPlugin,
             weapon_fx::WeaponFxPlugin,
-            tuning_ui::TuningUiPlugin,
             building_ui::BuildingUiPlugin,
             building_render::BuildingRenderPlugin,
             building_placement::BuildingPlacementPlugin,
             villager_render::VillagerRenderPlugin,
             auth_ui::AuthUiPlugin,
-        ));
+        ))
+        .add_plugins((pings::PingsPlugin, players_ui::PlayersUiPlugin));
 
     // Registers replicated components/events — must use the exact same
     // function the server calls, so wire IDs (assigned in registration

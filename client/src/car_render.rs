@@ -3,6 +3,8 @@ use shared::car_physics::{wheel_mounts, CarChassis, Wheel};
 use shared::protocol::{CarSnapshot, LocalCar};
 use shared::worldspace::WorldOrigin;
 
+use crate::owner_color::color_from_seed;
+
 pub struct CarRenderPlugin;
 
 impl Plugin for CarRenderPlugin {
@@ -147,17 +149,6 @@ fn init_car_visuals(
                 .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
         ));
     });
-}
-
-/// Deterministic seed -> vibrant paint color. Every car with the same
-/// `color_seed` (i.e. the same connection id — see `CarChassis::color_seed`'s
-/// docs) gets the same color on every viewer, since `CarChassis` itself is
-/// replicated. Fixed saturation/lightness, varying only hue, so every color
-/// reads clearly as "a car" against the terrain regardless of which hue it
-/// lands on.
-fn color_from_seed(seed: u32) -> Color {
-    let hue = (seed.wrapping_mul(2_654_435_761) % 360) as f32;
-    Color::hsl(hue, 0.75, 0.5)
 }
 
 /// Remote (non-local) cars have no Rapier body client-side at all — just

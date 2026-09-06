@@ -93,9 +93,12 @@ fn spawn_car_after_login(
     auth_state: Res<AuthState>,
     mut spawned: Local<bool>,
 ) {
-    if *spawned || !matches!(*auth_state, AuthState::LoggedIn) {
+    if *spawned {
         return;
     }
+    let AuthState::LoggedIn(player_id) = *auth_state else {
+        return;
+    };
     *spawned = true;
 
     // WorldOrigin always starts at true (0, 0, 0), so local and true
@@ -108,12 +111,12 @@ fn spawn_car_after_login(
     let spawn_z = spawn_true.z as f32;
 
     let mut chassis = shared::car_physics::default_chassis();
-    // Matches what the server will assign this same connection (see
+    // Matches what the server will assign this same account (see
     // CarChassis::color_seed's docs) — just a placeholder guess until the
     // server's authoritative chassis replicates back onto this same
-    // entity, but since both sides use the same connection id, it's
-    // already correct and there's no visible color pop.
-    chassis.color_seed = client_id.0 as u32;
+    // entity, but since both sides hash the same player_id, it's already
+    // correct and there's no visible color pop.
+    chassis.color_seed = crate::owner_color::seed_from_uuid(player_id);
     let half_extents = chassis.half_extents;
 
     commands.spawn((

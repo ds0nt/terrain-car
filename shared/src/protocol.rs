@@ -187,23 +187,6 @@ pub struct AuthResultMsg {
     pub message: String,
 }
 
-/// Sent client -> server from the live tuning panel (`Tab`, see client's
-/// `tuning_ui.rs`) whenever the player drags a slider. Carries every
-/// tunable field at once (not a delta) — simplest to reason about, and
-/// cheap enough at `Ordered` since sliders don't fire every frame. The
-/// server clamps every field to the same ranges the UI itself enforces
-/// before writing them into the sender's own `CarChassis` (never trust
-/// client-side clamping alone) — see `car_sim.rs`'s `apply_car_tune`.
-#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
-pub struct TuneCarMsg {
-    pub spring_stiffness: f32,
-    pub damper: f32,
-    pub engine_force: f32,
-    pub brake_force: f32,
-    pub traction: f32,
-    pub max_steer_rad: f32,
-}
-
 /// Sent client -> server when the player fires the front-mounted gun.
 /// Carries nothing: the server already knows who's shooting (the sending
 /// client's own car) and reads that car's current `Transform` for the
@@ -338,6 +321,39 @@ pub struct BuildingSnapshot {
 #[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct RecallToHangarMsg;
 
+/// Who owns this car, replicated alongside everything else on the same
+/// entity — lets every client build a "who's currently connected" list
+/// purely from ordinary car replication (see client's `players_ui.rs`)
+/// instead of a separate roster broadcast with its own lifecycle to keep
+/// in sync; a player's row naturally appears/disappears exactly when
+/// their car does. `replicate_once`: a username never changes after
+/// login.
+#[derive(Component, Serialize, Deserialize, Clone, Debug)]
+pub struct PlayerInfo {
+    pub player_id: Uuid,
+    pub username: String,
+}
+
+/// Sent client -> server to ping a location for every other player — no
+/// payload, like `FireGunMsg`: the server already knows who's asking and
+/// resolves their own car's current position as the ping location.
+/// `Unreliable`: a dropped ping just means try again, nothing to
+/// reconcile either way.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct PingMsg;
+
+/// Sent server -> every client once a `PingMsg` resolves — carries the
+/// pinging player's identity (so every client can render "who pinged" in
+/// their pings list, not just where) and the true-space location it
+/// resolved to.
+#[derive(Event, Serialize, Deserialize, Clone, Debug)]
+pub struct PingBroadcastMsg {
+    pub player_id: Uuid,
+    pub username: String,
+    pub true_x: f64,
+    pub true_z: f64,
+}
+
 /// Registers everything that must be identical between client and server:
 /// which components replicate (and how often), and the client -> server /
 /// server -> client event channels. Both binaries call this exact function
@@ -345,11 +361,11 @@ pub struct RecallToHangarMsg;
 /// drift between them.
 pub fn register_protocol(app: &mut App) {
     app
-        // Was replicate_once: with the live tuning panel (TuneCarMsg), a
-        // car's chassis stats can now change after spawn, and every
-        // connected client needs to see that change too, not just the
-        // player who tuned it.
-        .replicate::<CarChassis>()
+        // replicate_once: a car's tuning stats are fixed for its whole
+        // life (default_chassis(), the same for every car — see that
+        // function's docs on why client-side tuning was removed), so
+        // there's nothing to update after the initial spawn.
+        .replicate_once::<CarChassis>()
         .replicate::<CarSnapshot>()
         // Health changes constantly once guns exist — every client needs
         // to see it live, not just once at spawn.
@@ -360,7 +376,6 @@ pub fn register_protocol(app: &mut App) {
         .add_client_event::<RegenRequestMsg>(Channel::Ordered)
         .add_client_event::<FireGunMsg>(Channel::Unreliable)
         .add_server_event::<GunFiredMsg>(Channel::Unreliable)
-        .add_client_event::<TuneCarMsg>(Channel::Ordered)
         .add_client_event::<RegisterMsg>(Channel::Ordered)
         .add_client_event::<LoginMsg>(Channel::Ordered)
         .add_server_event::<AuthResultMsg>(Channel::Ordered)
@@ -369,6 +384,9 @@ pub fn register_protocol(app: &mut App) {
         .replicate::<VillagerSnapshot>()
         .add_client_event::<PlaceBuildingMsg>(Channel::Ordered)
         .add_client_event::<RecallToHangarMsg>(Channel::Ordered)
+        .replicate::<PlayerInfo>()
+        .add_client_event::<PingMsg>(Channel::Unreliable)
+        .add_server_event::<PingBroadcastMsg>(Channel::Unreliable)
         .add_server_event::<WorldRegenMsg>(Channel::Ordered)
         // Unreliable: purely cosmetic, and another strike is at most 10s
         // away anyway, so a dropped one is never worth retransmitting.

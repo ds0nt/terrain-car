@@ -6,13 +6,13 @@ use bevy_rapier3d::prelude::*;
 use bevy_replicon::prelude::*;
 use bevy_replicon::shared::backend::connected_client::NetworkId;
 use shared::car_physics::{
-    apply_tuning, compute_wheel_forces, default_chassis, wheel_mounts, CarChassis, CarInput,
-    CarInputState, WheelStepInput, CAR_ANGULAR_DAMPING, CAR_LINEAR_DAMPING, CAR_MASS,
+    compute_wheel_forces, default_chassis, wheel_mounts, CarChassis, CarInput, CarInputState,
+    WheelStepInput, CAR_ANGULAR_DAMPING, CAR_LINEAR_DAMPING, CAR_MASS,
 };
 use shared::combat::{Health, DEFAULT_MAX_HEALTH};
 use shared::protocol::{
-    spawn_car_signature, CarInputMsg, CarResetMsg, CarSnapshot, FlipUprightMsg, RegenRequestMsg,
-    TuneCarMsg, Wallet, WorldRegenMsg,
+    spawn_car_signature, CarInputMsg, CarResetMsg, CarSnapshot, FlipUprightMsg, PlayerInfo,
+    RegenRequestMsg, Wallet, WorldRegenMsg,
 };
 use uuid::Uuid;
 use shared::terrain_gen::{find_flat_spawn, height_at, random_seed, TerrainNoise};
@@ -56,7 +56,6 @@ impl Plugin for CarSimPlugin {
             .add_observer(apply_car_input)
             .add_observer(apply_car_reset)
             .add_observer(apply_flip_upright)
-            .add_observer(apply_car_tune)
             .add_observer(apply_world_regen_request)
             .add_systems(FixedUpdate, step_cars.before(PhysicsSet::SyncBackend))
             .add_systems(Update, recover_lost_cars);
@@ -235,6 +234,8 @@ pub(crate) fn spawn_car_for(
     world_state: &CurrentWorldState,
     network_ids: &Query<&NetworkId>,
     client_entity: Entity,
+    player_id: Uuid,
+    username: String,
     wallet: Wallet,
 ) -> DVec3 {
     let mut chassis = default_chassis();
@@ -244,10 +245,11 @@ pub(crate) fn spawn_car_for(
         .get(client_entity)
         .unwrap_or_else(|_| panic!("client `{client_entity}` has no NetworkId"))
         .get();
-    // Also this player's car color (see CarChassis::color_seed's docs) —
-    // reusing the connection id means the client's own local guess for its
-    // predicted car already matches what the server assigns, no pop.
-    chassis.color_seed = network_id as u32;
+    // This player's car color (see CarChassis::color_seed's docs) — hashed
+    // from their account id, not the connection id, so the client's own
+    // local guess for its predicted car already matches what the server
+    // assigns (no pop) and stays the same color across relaunches.
+    chassis.color_seed = shared::owner::seed_from_uuid(player_id);
 
     let index = registry
         .index_for(client_entity)
@@ -285,6 +287,10 @@ pub(crate) fn spawn_car_for(
             // hash-matching that merges this entity into the connecting
             // client's own.
             spawn_car_signature(client_entity, network_id),
+            // Lets every client build a "who's connected" list off
+            // ordinary replication (see client's `players_ui.rs`) — no
+            // separate roster message/lifecycle needed.
+            PlayerInfo { player_id, username },
         ),
     ));
 
@@ -428,38 +434,6 @@ fn apply_flip_upright(
     }
 }
 
-/// Authoritative half of the live tuning panel (`Tab`, client's
-/// `tuning_ui.rs`): a player can only ever tune their own car (found via
-/// `OwnedBy`, same authorization shape `RegenRequestMsg`'s op-check already
-/// uses, just scoped to "yourself" rather than "an op"), and every field is
-/// re-clamped here via `apply_tuning` regardless of what the UI already
-/// enforced — the client-side ranges are for slider feel, never trusted as
-/// the actual boundary. `CarChassis` is continuously replicated (see
-/// `register_protocol`), so the new values reach every other connected
-/// client automatically, the same way any other component change would.
-fn apply_car_tune(
-    tune_msg: On<FromClient<TuneCarMsg>>,
-    mut cars: Query<(&OwnedBy, &mut CarChassis)>,
-) {
-    let Some(client_entity) = tune_msg.client_id.entity() else {
-        return;
-    };
-    for (owner, mut chassis) in &mut cars {
-        if owner.0 != client_entity {
-            continue;
-        }
-        apply_tuning(
-            &mut chassis,
-            tune_msg.spring_stiffness,
-            tune_msg.damper,
-            tune_msg.engine_force,
-            tune_msg.brake_force,
-            tune_msg.traction,
-            tune_msg.max_steer_rad,
-        );
-        break;
-    }
-}
 
 /// Below this altitude (or a non-finite position/velocity), a car is
 /// considered lost rather than legitimately airborne — real terrain never

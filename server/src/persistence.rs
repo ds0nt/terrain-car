@@ -73,7 +73,11 @@ pub enum PersistenceEvent {
 /// Result of a `Register`/`Login` command — see `server::auth`, which
 /// drains these and turns them into an `AuthResultMsg` back to the client.
 pub enum AuthOutcome {
-    Success(Uuid),
+    /// Carries the username back alongside the id — `server::auth` needs
+    /// it to populate the replicated `PlayerInfo` on the new car, and it's
+    /// already known here (both `register`/`login` take it as an input),
+    /// no extra lookup.
+    Success { player_id: Uuid, username: String },
     UsernameTaken,
     /// Deliberately covers both "no such username" and "wrong password"
     /// identically — see `LoginMsg`'s own docs on why.
@@ -243,7 +247,7 @@ async fn register(pool: &PgPool, username: &str, password: &str) -> AuthOutcome 
     .await;
 
     match result {
-        Ok(_) => AuthOutcome::Success(player_id),
+        Ok(_) => AuthOutcome::Success { player_id, username: username.to_string() },
         Err(sqlx::Error::Database(e)) if e.is_unique_violation() => AuthOutcome::UsernameTaken,
         Err(e) => {
             warn!("persistence: register failed for `{username}`: {e}");
@@ -263,7 +267,7 @@ async fn login(pool: &PgPool, username: &str, password: &str) -> AuthOutcome {
     match row {
         Ok(Some((player_id, password_hash))) => {
             if verify_password(password, &password_hash) {
-                AuthOutcome::Success(player_id)
+                AuthOutcome::Success { player_id, username: username.to_string() }
             } else {
                 AuthOutcome::InvalidCredentials
             }

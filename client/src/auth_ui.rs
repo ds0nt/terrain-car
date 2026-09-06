@@ -1,8 +1,9 @@
 use bevy::prelude::*;
-use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
+use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use bevy_replicon::prelude::{ClientState, ClientTriggerExt};
 use shared::auth::{validate_password, validate_username};
 use shared::protocol::{AuthResultMsg, LoginMsg, RegisterMsg};
+use uuid::Uuid;
 
 /// Real accounts, replacing the old "trust whatever UUID the client
 /// claims" identity — see `shared::protocol::RegisterMsg`/`LoginMsg`'s
@@ -11,13 +12,19 @@ use shared::protocol::{AuthResultMsg, LoginMsg, RegisterMsg};
 /// `spawn_car_after_login`) doesn't spawn until then either, not just the
 /// server-authoritative one; only the world itself (terrain, camera) loads
 /// in the background while the login window is up.
+///
+/// Registers `bevy_egui::EguiPlugin` for the whole app — this used to be
+/// `tuning_ui.rs`'s job, but that panel was removed (client-side car
+/// tuning let any connected player self-serve a stats advantage); this is
+/// now the earliest/most fundamental egui consumer, so every other egui
+/// module (`building_ui.rs`, `minimap.rs`, `players_ui.rs`) leaves the
+/// registration to this one. Bevy panics on a duplicate registration.
 pub struct AuthUiPlugin;
 
 impl Plugin for AuthUiPlugin {
     fn build(&self, app: &mut App) {
-        // Does *not* register `EguiPlugin` — `tuning_ui.rs` already does
-        // that once for the whole app; a second registration would panic.
-        app.init_resource::<AuthState>()
+        app.add_plugins(EguiPlugin::default())
+            .init_resource::<AuthState>()
             .init_resource::<LoginForm>()
             .add_observer(apply_auth_result)
             .add_systems(EguiPrimaryContextPass, draw_login_window);
@@ -29,12 +36,16 @@ impl Plugin for AuthUiPlugin {
 /// the server is the sole authority on identity every single login.
 const LAST_USERNAME_PATH: &str = "last_username.txt";
 
-#[derive(Resource, Default)]
+#[derive(Resource, Default, Clone, Copy)]
 pub enum AuthState {
     #[default]
     LoggedOut,
     Pending,
-    LoggedIn,
+    /// Carries the account's durable `player_id` — needed by `car.rs`'s
+    /// `spawn_car_after_login` to derive a stable, account-based paint
+    /// color (see `owner_color::seed_from_uuid`) instead of the old
+    /// per-connection one.
+    LoggedIn(Uuid),
 }
 
 #[derive(Resource)]
@@ -134,7 +145,7 @@ fn apply_auth_result(result: On<AuthResultMsg>, mut state: ResMut<AuthState>, mu
     if result.ok {
         let player_id = result.player_id.expect("AuthResultMsg with ok=true always carries a player_id");
         info!("client: logged in as `{player_id}`");
-        *state = AuthState::LoggedIn;
+        *state = AuthState::LoggedIn(player_id);
         form.password.clear();
     } else {
         warn!("client: auth failed: {}", result.message);

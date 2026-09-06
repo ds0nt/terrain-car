@@ -29,6 +29,19 @@ impl Plugin for BuildingRenderPlugin {
 /// what will actually be placed. `ground_y` and `rotation_y` come from the
 /// caller (a live raycast for the ghost, the replicated snapshot for the
 /// real thing).
+/// The undecorated per-kind color — also used standalone by
+/// `building_ui.rs`'s bottom build bar as each kind's icon swatch, so the
+/// icon you click always matches what you actually place.
+pub(crate) fn base_color_for_kind(kind: BuildingKind) -> Color {
+    match kind {
+        BuildingKind::Ramp => Color::srgb(0.5, 0.45, 0.4),
+        BuildingKind::Hangar => Color::srgb(0.45, 0.45, 0.5),
+        BuildingKind::EnergyGenerator => Color::srgb(0.9, 0.8, 0.2),
+        BuildingKind::ExtractionFacility => Color::srgb(0.75, 0.4, 0.2),
+        BuildingKind::LandFactory => Color::srgb(0.3, 0.35, 0.32),
+    }
+}
+
 pub(crate) fn building_mesh_and_transform(
     kind: BuildingKind,
     meshes: &mut Assets<Mesh>,
@@ -37,6 +50,7 @@ pub(crate) fn building_mesh_and_transform(
     ground_y: f32,
     rotation_y: f32,
 ) -> (Handle<Mesh>, Color, Transform) {
+    let base_color = base_color_for_kind(kind);
     if kind == BuildingKind::Ramp {
         let (translation, rotation) = buildings::ramp_transform(local_x, local_z, ground_y, rotation_y);
         let mesh = meshes.add(Cuboid::new(
@@ -44,11 +58,7 @@ pub(crate) fn building_mesh_and_transform(
             buildings::RAMP_HALF_THICKNESS * 2.0,
             buildings::RAMP_HALF_LENGTH * 2.0,
         ));
-        return (
-            mesh,
-            Color::srgb(0.5, 0.45, 0.4),
-            Transform::from_translation(translation).with_rotation(rotation),
-        );
+        return (mesh, base_color, Transform::from_translation(translation).with_rotation(rotation));
     }
 
     // Cuboid/Cylinder dimensions and the collider used to actually block a
@@ -62,13 +72,6 @@ pub(crate) fn building_mesh_and_transform(
         ColliderShape::Cylinder { half_height, radius } => {
             meshes.add(Cylinder::new(radius, half_height * 2.0))
         }
-    };
-    let base_color = match kind {
-        BuildingKind::Hangar => Color::srgb(0.45, 0.45, 0.5),
-        BuildingKind::EnergyGenerator => Color::srgb(0.9, 0.8, 0.2),
-        BuildingKind::ExtractionFacility => Color::srgb(0.75, 0.4, 0.2),
-        BuildingKind::LandFactory => Color::srgb(0.3, 0.35, 0.32),
-        BuildingKind::Ramp => unreachable!("handled above"),
     };
     let transform = Transform::from_xyz(local_x, ground_y + shape.half_height(), local_z)
         .with_rotation(Quat::from_rotation_y(rotation_y));
@@ -100,6 +103,11 @@ fn init_building_visuals(
         snapshot.ground_y,
         snapshot.rotation_y,
     );
+    // Blended (not replaced) with the owner's color — a Hangar still
+    // reads as "a Hangar" at a glance, just visibly tinted by whose it
+    // is, same idea as `villager_render.rs`'s orb tint.
+    let owner_color = crate::owner_color::color_for_owner(snapshot.owner_player_id);
+    let base_color = base_color.mix(&owner_color, 0.5);
 
     let mut entity = commands.entity(insert.entity);
     entity.insert((

@@ -110,8 +110,10 @@ fn apply_auth_outcome(
 ) {
     for event in events.read() {
         let client_entity = event.client_entity;
-        let (ok, player_id, message) = match &event.outcome {
-            AuthOutcome::Success(player_id) => (true, Some(*player_id), "welcome".to_string()),
+        let (ok, identity, message) = match &event.outcome {
+            AuthOutcome::Success { player_id, username } => {
+                (true, Some((*player_id, username.clone())), "welcome".to_string())
+            }
             AuthOutcome::UsernameTaken => (false, None, "username already taken".to_string()),
             AuthOutcome::InvalidCredentials => (false, None, "invalid username or password".to_string()),
             AuthOutcome::Error(e) => (false, None, e.clone()),
@@ -119,10 +121,14 @@ fn apply_auth_outcome(
 
         commands.server_trigger(ToClients {
             targets: SendTargets::Single(ClientId::Client(client_entity)),
-            message: AuthResultMsg { ok, player_id, message },
+            message: AuthResultMsg {
+                ok,
+                player_id: identity.as_ref().map(|(id, _)| *id),
+                message,
+            },
         });
 
-        let Some(player_id) = player_id else {
+        let Some((player_id, username)) = identity else {
             continue;
         };
         identities.insert(client_entity, player_id);
@@ -141,6 +147,8 @@ fn apply_auth_outcome(
             &world_state,
             &network_ids,
             client_entity,
+            player_id,
+            username,
             Wallet { energy, ore },
         );
         spawn_villager_for_new_player(&mut commands, &villagers, player_id, spawn_true.x, spawn_true.z);

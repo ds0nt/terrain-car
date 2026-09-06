@@ -6,6 +6,7 @@ mod lightning;
 mod net;
 mod persistence;
 mod physics_fx;
+mod pings;
 mod terrain_phys;
 mod villagers;
 mod weapons;
@@ -71,7 +72,7 @@ fn main() {
         economy::EconomyPlugin,
         villagers::VillagersPlugin,
     ))
-    .add_plugins(auth::AuthPlugin);
+    .add_plugins((auth::AuthPlugin, pings::PingsPlugin));
 
     // Registers replicated components/events — must use the exact same
     // function the client calls, so wire IDs (assigned in registration

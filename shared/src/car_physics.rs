@@ -25,13 +25,15 @@ pub struct CarChassis {
     pub engine_force: f32,
     pub brake_force: f32,
     pub traction: f32,
-    /// Drives this car's paint color (see car_render.rs's `color_from_seed`)
-    /// — set by whoever spawns the car to that player's own connection id
-    /// (truncated), so it's already known and identical to both the server
-    /// and that player's own client before the server's authoritative
-    /// chassis even replicates back (no visible color pop on merge), and
-    /// every other client sees the same color too since `CarChassis`
-    /// itself is replicated.
+    /// Drives this car's paint color (see client's
+    /// `owner_color::color_from_seed`) — set by whoever spawns the car to
+    /// a hash of that player's durable account id (`owner_color::
+    /// seed_from_uuid`), so it's already known and identical to both the
+    /// server and that player's own client before the server's
+    /// authoritative chassis even replicates back (no visible color pop
+    /// on merge), every other client sees the same color too since
+    /// `CarChassis` itself is replicated, *and* it stays the same color
+    /// across relaunches (account-based, not per-connection).
     pub color_seed: u32,
 }
 
@@ -103,50 +105,14 @@ pub fn default_chassis() -> CarChassis {
         // an insane top end.
         engine_force: 22_000.0,
         brake_force: 20_000.0,
-        traction: 12_000.0,
+        // Lowered slightly from 12_000.0 — a touch less grip reads better
+        // on "insane terrain" than sticking dead to the surface.
+        traction: 10_000.0,
         // Caller sets this to the actual player's connection id — this
         // placeholder only matters if something spawns a car without ever
         // overwriting it.
         color_seed: 0,
     }
-}
-
-/// Slider ranges for the live tuning panel (client's `tuning_ui.rs`) and
-/// the server's authoritative clamp on `TuneCarMsg` (`car_sim.rs`'s
-/// `apply_car_tune`) — defined once here so the two can never disagree
-/// (a UI slider showing a wider range than the server actually accepts
-/// would silently snap back, which reads as a broken slider). Centered
-/// loosely around `default_chassis()`'s own values; deliberately excludes
-/// `half_extents`/`wheel_radius`, which drive the fixed mesh/collider
-/// shape — live-resizing those is a separate, much bigger problem (mesh
-/// regen, collider replacement, wheel remount recompute).
-pub const SPRING_STIFFNESS_RANGE: (f32, f32) = (20_000.0, 120_000.0);
-pub const DAMPER_RANGE: (f32, f32) = (2_000.0, 20_000.0);
-pub const ENGINE_FORCE_RANGE: (f32, f32) = (8_000.0, 45_000.0);
-pub const BRAKE_FORCE_RANGE: (f32, f32) = (5_000.0, 40_000.0);
-pub const TRACTION_RANGE: (f32, f32) = (3_000.0, 25_000.0);
-pub const MAX_STEER_RAD_RANGE: (f32, f32) = (10f32.to_radians(), 50f32.to_radians());
-
-/// Clamps every tunable field of a `TuneCarMsg`-shaped set of values to the
-/// ranges above and writes them into `chassis` — the one place both the
-/// server (authoritative) and nothing else need to agree on, since the
-/// client-side UI enforces the same ranges only for a good slider *feel*,
-/// never as the actual security boundary.
-pub fn apply_tuning(
-    chassis: &mut CarChassis,
-    spring_stiffness: f32,
-    damper: f32,
-    engine_force: f32,
-    brake_force: f32,
-    traction: f32,
-    max_steer_rad: f32,
-) {
-    chassis.spring_stiffness = spring_stiffness.clamp(SPRING_STIFFNESS_RANGE.0, SPRING_STIFFNESS_RANGE.1);
-    chassis.damper = damper.clamp(DAMPER_RANGE.0, DAMPER_RANGE.1);
-    chassis.engine_force = engine_force.clamp(ENGINE_FORCE_RANGE.0, ENGINE_FORCE_RANGE.1);
-    chassis.brake_force = brake_force.clamp(BRAKE_FORCE_RANGE.0, BRAKE_FORCE_RANGE.1);
-    chassis.traction = traction.clamp(TRACTION_RANGE.0, TRACTION_RANGE.1);
-    chassis.max_steer_rad = max_steer_rad.clamp(MAX_STEER_RAD_RANGE.0, MAX_STEER_RAD_RANGE.1);
 }
 
 /// Local (chassis-space) mount point and is-front flag for each of the 4
