@@ -34,6 +34,7 @@ Environment variables:
 - `TERRAIN_CAR_PORT` — server listen port (default `5000`)
 - `TERRAIN_CAR_SERVER` — client connect target, `host:port` (default `127.0.0.1:5000`)
 - `TERRAIN_CAR_RECORD_ROOT` — session recorder output directory
+- `SUPABASE_DB_URL` — Postgres connection string (`postgresql://postgres:PASSWORD@db.PROJECT.supabase.co:5432/postgres`) for the server's persistence layer (base-building state — see `server/src/persistence.rs`). URL-encode special characters in the password (e.g. `@` → `%40`, `!` → `%21`). Optional: without it, the server runs normally, just without anything persisting.
 
 ## Controls
 

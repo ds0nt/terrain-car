@@ -2,6 +2,7 @@ mod car_sim;
 mod console;
 mod lightning;
 mod net;
+mod persistence;
 mod physics_fx;
 mod terrain_phys;
 mod weapons;
@@ -48,6 +49,7 @@ fn main() {
         RapierPhysicsPlugin::<NoUserData>::default().in_fixed_schedule(),
         RepliconPlugins,
         net::ServerNetPlugin,
+        persistence::PersistencePlugin,
         terrain_phys::ServerTerrainPlugin,
         car_sim::CarSimPlugin,
         console::ConsolePlugin,

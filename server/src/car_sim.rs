@@ -18,6 +18,7 @@ use uuid::Uuid;
 use shared::terrain_gen::{find_flat_spawn, height_at, random_seed, TerrainNoise};
 use shared::worldspace::WorldOrigin;
 
+use crate::persistence::{Persistence, PersistenceCommand};
 use crate::terrain_phys::{regenerate_terrain_colliders, ServerTerrainEntity};
 use crate::weapons::LastFired;
 
@@ -118,11 +119,20 @@ impl PlayerIdentities {
 fn apply_identify(
     identify: On<FromClient<IdentifyMsg>>,
     mut identities: ResMut<PlayerIdentities>,
+    persistence: Res<Persistence>,
 ) {
     let Some(client_entity) = identify.client_id.entity() else {
         return;
     };
-    identities.0.insert(client_entity, identify.player_id);
+    let is_new = identities.0.insert(client_entity, identify.player_id).is_none();
+    if is_new {
+        // Only worth a round-trip the first time this connection
+        // identifies (IdentifyMsg is otherwise resent every couple of
+        // seconds for the reasons in its own docs) — an `on conflict do
+        // nothing` upsert either way, so a duplicate would be harmless,
+        // just wasted.
+        persistence.send(PersistenceCommand::UpsertPlayer(identify.player_id));
+    }
 }
 
 /// Client entities currently holding operator privileges (granted/revoked

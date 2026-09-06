@@ -26,3 +26,7 @@ bevy_replicon = "0.44.0"
 bevy_replicon_renet = "0.20.0"
 rand = "0.8"
 uuid = { version = "1.26.0", features = ["serde"] }
+# default-features = false: sqlx's defaults pull in mysql/sqlite drivers
+# too — this server only ever talks to Postgres (Supabase).
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "migrate", "macros", "uuid"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
