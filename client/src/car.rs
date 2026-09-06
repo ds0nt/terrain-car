@@ -4,8 +4,10 @@ use bevy_rapier3d::prelude::*;
 use bevy_replicon::prelude::ClientTriggerExt;
 pub use shared::car_physics::{CarChassis, CarInput};
 use shared::car_physics::{compute_wheel_forces, Wheel, WheelStepInput};
+use shared::buildings::{STARTING_ENERGY, STARTING_ORE};
 use shared::combat::{Health, DEFAULT_MAX_HEALTH};
 pub use shared::protocol::LocalCar;
+use shared::protocol::Wallet;
 use shared::terrain_gen::{find_flat_spawn, height_at, TerrainNoise};
 
 use crate::terrain::{RegenerateWorldEvent, TerrainTracker};
@@ -118,6 +120,12 @@ fn spawn_car(
         // applies here too) — every car starts at full health, so this
         // guess is always right at connect time.
         Health::full(DEFAULT_MAX_HEALTH),
+        // Guess for a brand-new player; a returning player's real balance
+        // (loaded from Postgres) replaces this within moments of the
+        // server's Wallet component replicating in — same one-tick-visible
+        // "usually right, corrected fast if not" tradeoff CarChassis's
+        // color_seed guess already accepts.
+        Wallet { energy: STARTING_ENERGY, ore: STARTING_ORE },
         TerrainTracker,
         LocalCar(client_id.0),
     ));

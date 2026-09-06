@@ -12,7 +12,7 @@ use shared::car_physics::{
 use shared::combat::{Health, DEFAULT_MAX_HEALTH};
 use shared::protocol::{
     spawn_car_signature, CarInputMsg, CarResetMsg, CarSnapshot, IdentifyMsg, RegenRequestMsg,
-    TuneCarMsg, WorldRegenMsg,
+    TuneCarMsg, Wallet, WorldRegenMsg,
 };
 use uuid::Uuid;
 use shared::terrain_gen::{find_flat_spawn, height_at, random_seed, TerrainNoise};
@@ -263,6 +263,10 @@ fn spawn_car_on_connect(
         CarSnapshot::default(),
         (
             Health::full(DEFAULT_MAX_HEALTH),
+            // Real value follows shortly via economy.rs's sync_wallet_components
+            // once IdentifyMsg/the loaded wallet arrives — 0/0 in the
+            // meantime is honest (this connection hasn't identified yet).
+            Wallet::default(),
             LastFired::default(),
             OwnedBy(client_entity),
             Replicated,

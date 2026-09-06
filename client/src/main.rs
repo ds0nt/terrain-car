@@ -1,3 +1,5 @@
+mod building_render;
+mod building_ui;
 mod camera;
 mod car;
 mod car_render;
@@ -69,6 +71,8 @@ fn main() {
             bevy_hanabi::HanabiPlugin,
             weapon_fx::WeaponFxPlugin,
             tuning_ui::TuningUiPlugin,
+            building_ui::BuildingUiPlugin,
+            building_render::BuildingRenderPlugin,
         ));
 
     // Registers replicated components/events — must use the exact same

@@ -9,7 +9,7 @@ use uuid::Uuid;
 use shared::buildings::{BuildingKind, STARTING_ENERGY, STARTING_ORE};
 use shared::deposits::is_near_deposit;
 use shared::protocol::{
-    BuildingSnapshot, CarSnapshot, IdentifyMsg, PlaceBuildingMsg, RecallToHangarMsg,
+    BuildingSnapshot, CarSnapshot, IdentifyMsg, PlaceBuildingMsg, RecallToHangarMsg, Wallet,
 };
 use shared::terrain_gen::{height_at, TerrainNoise};
 use shared::worldspace::WorldOrigin;
@@ -39,7 +39,7 @@ impl Plugin for EconomyPlugin {
             .add_observer(seed_wallet_on_identify)
             .add_observer(apply_place_building)
             .add_observer(apply_recall_to_hangar)
-            .add_systems(Update, (apply_loaded_state, tick_production));
+            .add_systems(Update, (apply_loaded_state, tick_production, sync_wallet_components));
     }
 }
 
@@ -260,7 +260,6 @@ fn apply_recall_to_hangar(
         snapshot.reset_generation = snapshot.reset_generation.wrapping_add(1);
         break;
     }
-
 }
 
 /// Credits every completed building's owner at `PRODUCTION_TICK_SECS`
@@ -303,6 +302,31 @@ fn tick_production(
                 energy: energy as f64,
                 ore: ore as f64,
             }));
+        }
+    }
+}
+
+/// Mirrors the authoritative in-memory `Wallets` map onto each connected
+/// player's own car as a replicated `Wallet` component — a simple,
+/// self-healing "keep these in sync" pass every frame (cheap: a handful of
+/// connected cars, one hashmap lookup each) rather than pushing updates
+/// from every place a wallet can change (seed/placement/production), which
+/// would be three separate paths to keep consistent instead of one.
+fn sync_wallet_components(
+    wallets: Res<Wallets>,
+    identities: Res<PlayerIdentities>,
+    mut cars: Query<(&OwnedBy, &mut Wallet)>,
+) {
+    for (owner, mut wallet) in &mut cars {
+        let Some(player_id) = identities.get(owner.0) else {
+            continue;
+        };
+        let Some(&(energy, ore)) = wallets.0.get(&player_id) else {
+            continue;
+        };
+        if wallet.energy != energy || wallet.ore != ore {
+            wallet.energy = energy;
+            wallet.ore = ore;
         }
     }
 }

@@ -217,6 +217,21 @@ pub struct LightningStrikeMsg {
     pub radius: f32,
 }
 
+/// A mirror of the sender's own server-side wallet (`server::economy::
+/// Wallets`, keyed by the durable `PersistentPlayerId`), attached to their
+/// car entity purely so it replicates and the HUD can show it — same
+/// "server holds the real authoritative state, a component on the car is
+/// just how it reaches clients" relationship `Health` already has. Kept as
+/// its own component (not folded into `Health` or `CarChassis`) since it's
+/// conceptually per-*player*, not per-car; it happens to ride on the car
+/// entity today only because that's the one entity every client already
+/// has a replicated handle to.
+#[derive(Component, Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct Wallet {
+    pub energy: f32,
+    pub ore: f32,
+}
+
 /// Sent client -> server to place a building. `true_x`/`true_z` is where
 /// the player wants it (their car's current position — see client's
 /// `building_ui.rs`); the server is the sole authority on whether it's
@@ -280,6 +295,7 @@ pub fn register_protocol(app: &mut App) {
         .add_server_event::<GunFiredMsg>(Channel::Unreliable)
         .add_client_event::<TuneCarMsg>(Channel::Ordered)
         .add_client_event::<IdentifyMsg>(Channel::Ordered)
+        .replicate::<Wallet>()
         .replicate::<BuildingSnapshot>()
         .add_client_event::<PlaceBuildingMsg>(Channel::Ordered)
         .add_client_event::<RecallToHangarMsg>(Channel::Ordered)
