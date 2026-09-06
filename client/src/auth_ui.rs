@@ -3,7 +3,6 @@ use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use bevy_replicon::prelude::{ClientState, ClientTriggerExt};
 use shared::auth::{validate_password, validate_username};
 use shared::protocol::{AuthResultMsg, LoginMsg, RegisterMsg};
-use uuid::Uuid;
 
 /// Real accounts, replacing the old "trust whatever UUID the client
 /// claims" identity — see `shared::protocol::RegisterMsg`/`LoginMsg`'s
@@ -26,10 +25,18 @@ impl Plugin for AuthUiPlugin {
         app.add_plugins(EguiPlugin::default())
             .init_resource::<AuthState>()
             .init_resource::<LoginForm>()
+            .add_message::<LoginAttempted>()
             .add_observer(apply_auth_result)
             .add_systems(EguiPrimaryContextPass, draw_login_window);
     }
 }
+
+/// Fired the instant a Register/Login request is actually sent (not when
+/// the response comes back) — see `car.rs`'s `spawn_car_after_login` for
+/// why the car's own predicted spawn needs to react to *this*, not
+/// `AuthResultMsg`.
+#[derive(Message, Clone, Copy)]
+pub struct LoginAttempted;
 
 /// Where the last-used username is cached purely to prefill the login
 /// form on relaunch — never the password, and never trusted for anything;
@@ -41,11 +48,12 @@ pub enum AuthState {
     #[default]
     LoggedOut,
     Pending,
-    /// Carries the account's durable `player_id` — needed by `car.rs`'s
-    /// `spawn_car_after_login` to derive a stable, account-based paint
-    /// color (see `owner_color::seed_from_uuid`) instead of the old
-    /// per-connection one.
-    LoggedIn(Uuid),
+    /// Whether the local player themselves has ever spawned a car isn't
+    /// tracked here — `car.rs`'s `spawn_car_after_login` reacts directly
+    /// to the same `AuthResultMsg` this variant is set from (see that
+    /// function's docs on why it can't afford the extra lag of instead
+    /// polling this resource), so it needs no payload.
+    LoggedIn,
 }
 
 #[derive(Resource)]
@@ -62,12 +70,14 @@ impl Default for LoginForm {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_login_window(
     mut contexts: EguiContexts,
     mut state: ResMut<AuthState>,
     mut form: ResMut<LoginForm>,
     mut commands: Commands,
     client_state: Res<State<ClientState>>,
+    mut attempted_events: MessageWriter<LoginAttempted>,
 ) -> Result {
     if !matches!(*state, AuthState::LoggedOut | AuthState::Pending) {
         return Ok(());
@@ -99,10 +109,10 @@ fn draw_login_window(
 
             ui.horizontal(|ui| {
                 if ui.button("Log In").clicked() {
-                    try_submit(&mut state, &mut form, &mut commands, false);
+                    try_submit(&mut state, &mut form, &mut commands, &mut attempted_events, false);
                 }
                 if ui.button("Register").clicked() {
-                    try_submit(&mut state, &mut form, &mut commands, true);
+                    try_submit(&mut state, &mut form, &mut commands, &mut attempted_events, true);
                 }
             });
         });
@@ -118,7 +128,13 @@ fn draw_login_window(
     Ok(())
 }
 
-fn try_submit(state: &mut AuthState, form: &mut LoginForm, commands: &mut Commands, is_register: bool) {
+fn try_submit(
+    state: &mut AuthState,
+    form: &mut LoginForm,
+    commands: &mut Commands,
+    attempted_events: &mut MessageWriter<LoginAttempted>,
+    is_register: bool,
+) {
     if let Err(reason) = validate_username(&form.username) {
         form.error = Some(reason.to_string());
         return;
@@ -138,6 +154,10 @@ fn try_submit(state: &mut AuthState, form: &mut LoginForm, commands: &mut Comman
         commands
             .client_trigger(LoginMsg { username: form.username.clone(), password: form.password.clone() });
     }
+    // Fired on every attempt, not just the first — `car.rs`'s own
+    // one-shot latch decides whether this actually spawns anything, so a
+    // retry after a failed attempt is harmless to also report here.
+    attempted_events.write(LoginAttempted);
     *state = AuthState::Pending;
 }
 
@@ -145,7 +165,7 @@ fn apply_auth_result(result: On<AuthResultMsg>, mut state: ResMut<AuthState>, mu
     if result.ok {
         let player_id = result.player_id.expect("AuthResultMsg with ok=true always carries a player_id");
         info!("client: logged in as `{player_id}`");
-        *state = AuthState::LoggedIn(player_id);
+        *state = AuthState::LoggedIn;
         form.password.clear();
     } else {
         warn!("client: auth failed: {}", result.message);

@@ -10,7 +10,7 @@ pub use shared::protocol::LocalCar;
 use shared::protocol::Wallet;
 use shared::terrain_gen::{find_flat_spawn, height_at, TerrainNoise};
 
-use crate::auth_ui::AuthState;
+use crate::auth_ui::LoginAttempted;
 use crate::terrain::{RegenerateWorldEvent, TerrainTracker};
 use crate::worldspace::WorldOrigin;
 
@@ -76,29 +76,42 @@ fn read_car_input(keyboard: Res<ButtonInput<KeyCode>>, mut input: ResMut<CarInpu
 ///
 /// Tagged `LocalCar` (requires `Signature::of::<LocalCar>()`, see
 /// protocol.rs) so that once the server's authoritative version of this
-/// same car replicates in, bevy_replicon merges it into this entity instead
-/// of spawning a visible duplicate — this spawn *is* the client-side
-/// prediction: it runs the instant login succeeds (not delayed further
-/// waiting on the server's own echo), so driving never waits on the round
-/// trip once you're actually in. Gated on `AuthState::LoggedIn` — see
-/// `auth_ui.rs` — rather than firing at `Startup` like it used to: nothing
-/// should be drivable before the player has actually logged in, only the
-/// world itself loads in the background while the login window is up.
-/// `spawned` is a one-shot latch, since `Update` runs every frame but this
-/// must only ever fire once per login.
+/// same car replicates in, bevy_replicon merges it into this entity
+/// instead of spawning a visible duplicate — this spawn *is* the
+/// client-side prediction.
+///
+/// Reacts to `LoginAttempted` (fired the instant a Register/Login
+/// request is *sent*, see `auth_ui.rs`), not `AuthResultMsg` (the
+/// response): tried reacting to the response first, on the theory that
+/// the server sends it before spawning the authoritative car so this
+/// side would still have a head start — but replication and custom
+/// events travel over separate renet channels with no ordering guarantee
+/// between them, so the car's own replicated data could (and, tested
+/// live, reliably did) arrive before this side ever got the message,
+/// losing the signature match entirely. The player ended up with two
+/// disconnected cars — their own undriven predicted one, plus a separate
+/// "remote-looking" copy of the real one — and since every distance
+/// check (e.g. building placement) validates against that real, unmerged
+/// car rather than the one the camera was actually following, placing
+/// anything failed with "too far away" while standing right next to the
+/// target. Reacting to the *request* instead means racing a full network
+/// round trip, not another message on a different channel — a much
+/// safer margin. The account's real `player_id` isn't known yet at this
+/// point (a fresh registration doesn't even have one server-side yet),
+/// so `color_seed` falls back to the old connection-id-based guess here;
+/// once the real `CarChassis` merges in it corrects to the account-based
+/// color same as ever. `spawned` is a one-shot latch — a failed attempt's
+/// retry reuses the same already-spawned car rather than spawning again.
 fn spawn_car_after_login(
+    mut attempted_events: MessageReader<LoginAttempted>,
     mut commands: Commands,
     noise: Res<TerrainNoise>,
     client_id: Res<crate::net::LocalClientId>,
-    auth_state: Res<AuthState>,
     mut spawned: Local<bool>,
 ) {
-    if *spawned {
+    if *spawned || attempted_events.read().next().is_none() {
         return;
     }
-    let AuthState::LoggedIn(player_id) = *auth_state else {
-        return;
-    };
     *spawned = true;
 
     // WorldOrigin always starts at true (0, 0, 0), so local and true
@@ -111,12 +124,14 @@ fn spawn_car_after_login(
     let spawn_z = spawn_true.z as f32;
 
     let mut chassis = shared::car_physics::default_chassis();
-    // Matches what the server will assign this same account (see
-    // CarChassis::color_seed's docs) — just a placeholder guess until the
-    // server's authoritative chassis replicates back onto this same
-    // entity, but since both sides hash the same player_id, it's already
-    // correct and there's no visible color pop.
-    chassis.color_seed = crate::owner_color::seed_from_uuid(player_id);
+    // The account's real player_id isn't known yet at this point (see
+    // this function's own docs) — this connection-id-based guess is
+    // wrong for a returning player (a different color every relaunch,
+    // the exact problem account-based coloring was meant to fix) and
+    // gets corrected the moment the real, account-colored CarChassis
+    // replicates in and merges with this entity, same one-tick-visible
+    // tradeoff every other predicted-spawn guess in this file accepts.
+    chassis.color_seed = client_id.0 as u32;
     let half_extents = chassis.half_extents;
 
     commands.spawn((
