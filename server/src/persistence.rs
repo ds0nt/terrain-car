@@ -185,27 +185,43 @@ fn run_persistence_thread(
             let _ = event_tx.send(loaded);
         }
 
+        // Spawned per command, not awaited in line: this pool has 5
+        // concurrent connections to actually use, but a plain sequential
+        // `while let ... { ... .await }` loop only ever has one command's
+        // round trip in flight at a time. With production ticking a save
+        // roughly once a second per active building, that queue backs up
+        // fast — and a player's own Register/Login could land behind a
+        // long line of routine wallet/building saves with no priority at
+        // all, which is exactly what made login take on the order of a
+        // minute during real play instead of a normal round trip. Each
+        // command now runs as its own task the moment it's received, so a
+        // login sent while ten saves are already in flight actually gets
+        // to run alongside them instead of waiting its turn.
         while let Ok(command) = cmd_rx.recv() {
-            match command {
-                PersistenceCommand::SaveWallet(wallet) => {
-                    if let Err(e) = save_wallet(&pool, &wallet).await {
-                        warn!("persistence: failed to save wallet for {}: {e}", wallet.player_id);
+            let pool = pool.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                match command {
+                    PersistenceCommand::SaveWallet(wallet) => {
+                        if let Err(e) = save_wallet(&pool, &wallet).await {
+                            warn!("persistence: failed to save wallet for {}: {e}", wallet.player_id);
+                        }
+                    }
+                    PersistenceCommand::SaveBuilding(building) => {
+                        if let Err(e) = save_building(&pool, &building).await {
+                            warn!("persistence: failed to save building {}: {e}", building.id);
+                        }
+                    }
+                    PersistenceCommand::Register { client_entity, username, password } => {
+                        let outcome = register(&pool, &username, &password).await;
+                        let _ = event_tx.send(PersistenceEvent::AuthResult { client_entity, outcome });
+                    }
+                    PersistenceCommand::Login { client_entity, username, password } => {
+                        let outcome = login(&pool, &username, &password).await;
+                        let _ = event_tx.send(PersistenceEvent::AuthResult { client_entity, outcome });
                     }
                 }
-                PersistenceCommand::SaveBuilding(building) => {
-                    if let Err(e) = save_building(&pool, &building).await {
-                        warn!("persistence: failed to save building {}: {e}", building.id);
-                    }
-                }
-                PersistenceCommand::Register { client_entity, username, password } => {
-                    let outcome = register(&pool, &username, &password).await;
-                    let _ = event_tx.send(PersistenceEvent::AuthResult { client_entity, outcome });
-                }
-                PersistenceCommand::Login { client_entity, username, password } => {
-                    let outcome = login(&pool, &username, &password).await;
-                    let _ = event_tx.send(PersistenceEvent::AuthResult { client_entity, outcome });
-                }
-            }
+            });
         }
     });
 }
