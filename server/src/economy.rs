@@ -8,11 +8,11 @@ use uuid::Uuid;
 
 use shared::buildings::{BuildingKind, STARTING_ENERGY, STARTING_ORE};
 use shared::deposits::is_near_deposit;
-use shared::protocol::{BuildingSnapshot, CarSnapshot, PlaceBuildingMsg, RecallToHangarMsg, Wallet};
+use shared::protocol::{BuildingSnapshot, DestroyBuildingMsg, PlaceBuildingMsg, Wallet};
 use shared::terrain_gen::{height_at, TerrainNoise};
 use shared::worldspace::WorldOrigin;
 
-use crate::car_sim::{OwnedBy, PlayerIdentities};
+use crate::car_sim::{OwnedBy, PlayerIdentities, PlayerPositions};
 use crate::persistence::{BuildingRow, Persistence, PersistenceCommand, PersistenceEvent, WalletRow};
 
 /// How close (true-space) a placement request must be to the sender's own
@@ -36,7 +36,7 @@ impl Plugin for EconomyPlugin {
                 TimerMode::Repeating,
             )))
             .add_observer(apply_place_building)
-            .add_observer(apply_recall_to_hangar)
+            .add_observer(apply_destroy_building)
             .add_systems(Update, (apply_loaded_state, tick_production, sync_wallet_components));
     }
 }
@@ -109,21 +109,27 @@ fn apply_loaded_state(
     mut commands: Commands,
     persistence: Res<Persistence>,
     mut wallets: ResMut<Wallets>,
+    mut positions: ResMut<PlayerPositions>,
     origin: Res<WorldOrigin>,
     mut auth_events: MessageWriter<crate::auth::AuthOutcomeReceived>,
 ) {
     while let Some(event) = persistence.try_recv() {
         match event {
-            PersistenceEvent::Loaded { wallets: loaded_wallets, buildings } => {
+            PersistenceEvent::Loaded { wallets: loaded_wallets, buildings, positions: loaded_positions } => {
                 for wallet in loaded_wallets {
                     wallets.0.insert(wallet.player_id, (wallet.energy as f32, wallet.ore as f32));
                 }
                 for building in buildings {
                     spawn_building_from_row(&mut commands, &origin, &building);
                 }
+                let loaded_position_count = loaded_positions.len();
+                for position in loaded_positions {
+                    positions.set(position.player_id, (position.true_x, position.true_z));
+                }
                 info!(
-                    "economy: applied {} loaded wallet(s)",
-                    wallets.0.len()
+                    "economy: applied {} loaded wallet(s), {} loaded position(s)",
+                    wallets.0.len(),
+                    loaded_position_count
                 );
             }
             PersistenceEvent::Unavailable => {
@@ -153,9 +159,11 @@ fn apply_loaded_state(
 /// the server's own authoritative Rapier world — which is what lets a
 /// Ramp start on top of another existing Ramp instead of always sitting on
 /// raw terrain).
+#[allow(clippy::too_many_arguments)]
 fn spawn_building(
     commands: &mut Commands,
     origin: &WorldOrigin,
+    id: Uuid,
     kind: BuildingKind,
     owner_player_id: Uuid,
     true_x: f64,
@@ -165,22 +173,18 @@ fn spawn_building(
     ground_y: f32,
 ) -> Entity {
     let mut entity = commands.spawn((
-        BuildingSnapshot { kind, owner_player_id, true_x, true_z, build_complete_at, rotation_y, ground_y },
+        BuildingSnapshot { id, kind, owner_player_id, true_x, true_z, build_complete_at, rotation_y, ground_y },
         Replicated,
     ));
 
     let local = (bevy::math::DVec3::new(true_x, 0.0, true_z) - origin.offset).as_vec3();
-    if kind.is_drivable_structure() {
-        let (translation, rotation) =
-            shared::buildings::ramp_transform(local.x, local.z, ground_y, rotation_y);
+    if kind.uses_slab_geometry() {
+        let dims = shared::buildings::slab_dims(kind);
+        let (translation, rotation) = shared::buildings::slab_transform(dims, local.x, local.z, ground_y, rotation_y);
         entity.insert((
             Transform::from_translation(translation).with_rotation(rotation),
             RigidBody::Fixed,
-            Collider::cuboid(
-                shared::buildings::RAMP_HALF_WIDTH,
-                shared::buildings::RAMP_HALF_THICKNESS,
-                shared::buildings::RAMP_HALF_LENGTH,
-            ),
+            Collider::cuboid(dims.half_width, dims.half_height, dims.half_length),
             Friction::coefficient(1.0),
         ));
     } else {
@@ -215,21 +219,89 @@ fn spawn_building(
 /// back to raw terrain height if nothing at all is hit (shouldn't happen
 /// in practice — terrain always has a collider — but a placement request
 /// is exactly the kind of place to not `unwrap` that assumption away).
-fn surface_height_at(
-    context: RapierContext<'_>,
+/// Raycasts straight down from well above `(true_x, true_z)` against the
+/// server's own real physics colliders — terrain, buildings, ramps alike —
+/// falling back to raw terrain height (`height_at`) only if nothing was
+/// hit. `pub(crate)` so `car_sim::apply_flip_upright`/`apply_recall_to_hangar`
+/// and `aircraft::apply_recall_plane` can reuse it too: a bare `height_at`
+/// call there had exactly this module's own reason to avoid one (see this
+/// function's original docs) — pressing R while parked on a Ramp or a
+/// building's roof dropped the car straight to the *raw terrain* height
+/// underneath, embedding it inside/under whatever it had actually been
+/// resting on, reported live as ending up under terrain after driving
+/// somewhere and pressing R.
+///
+/// `exclude` should always be the vehicle actually being repositioned, if
+/// there is one — without it, the ray (cast straight down through that
+/// same vehicle's own current position) hits that vehicle's *own*
+/// collider first, especially likely for a flip-upright call (the vehicle
+/// is on its roof/side at exactly that point) or a recall bringing it back
+/// to a spot it's already sitting on. That read as the same "ends up
+/// underground" symptom as the missing-raycast bug above for a different
+/// reason: `ground_y` came back as the vehicle's *own* current surface
+/// height instead of the real ground beneath it. `None` is correct only
+/// when nothing already occupies that exact point (a fresh building
+/// placement, before it exists at all — see `settle_ground_y`).
+pub(crate) fn surface_height_at(
+    context: &RapierContext<'_>,
     noise: &TerrainNoise,
     origin: &WorldOrigin,
     true_x: f64,
     true_z: f64,
+    exclude: Option<Entity>,
 ) -> f32 {
     let local = (bevy::math::DVec3::new(true_x, 0.0, true_z) - origin.offset).as_vec3();
     const RAY_START_HEIGHT: f32 = 10_000.0;
     let ray_origin = Vec3::new(local.x, RAY_START_HEIGHT, local.z);
-    match context.cast_ray(ray_origin, Vec3::NEG_Y, RAY_START_HEIGHT * 2.0, true, QueryFilter::default())
-    {
+    let mut filter = QueryFilter::default();
+    if let Some(exclude) = exclude {
+        filter = filter.exclude_rigid_body(exclude);
+    }
+    match context.cast_ray(ray_origin, Vec3::NEG_Y, RAY_START_HEIGHT * 2.0, true, filter) {
         Some((_, toi)) => RAY_START_HEIGHT - toi,
         None => height_at(noise, true_x, true_z),
     }
+}
+
+/// The `ground_y` a newly-placed building should actually use — for
+/// `Ramp` this is still just the single point under its anchor (its own
+/// `ramp_transform` already handles sitting a tilted box on that), but
+/// every other kind samples every corner/rim point of its real footprint
+/// (`shared::buildings::footprint_sample_offsets`) and settles to the
+/// *lowest* of them, minus `FOOTPRINT_BURY_MARGIN`. Center-point-only
+/// placement left a building's base floating or half-exposed on anything
+/// but flat ground; sinking to the lowest sampled point instead means the
+/// whole base ends up buried at or below the surface everywhere under it.
+fn settle_ground_y(
+    context: Option<RapierContext<'_>>,
+    noise: &TerrainNoise,
+    origin: &WorldOrigin,
+    kind: BuildingKind,
+    true_x: f64,
+    true_z: f64,
+    rotation_y: f32,
+) -> f32 {
+    let sample = |x: f64, z: f64| match &context {
+        // `None` exclude — nothing occupies this exact spot yet, the
+        // building being placed doesn't exist until after this returns.
+        Some(context) => surface_height_at(context, noise, origin, x, z, None),
+        None => height_at(noise, x, z),
+    };
+
+    if kind.uses_slab_geometry() {
+        return sample(true_x, true_z);
+    }
+
+    let (sin, cos) = rotation_y.sin_cos();
+    shared::buildings::footprint_sample_offsets(shared::buildings::collider_shape(kind))
+        .into_iter()
+        .map(|(ox, oz)| {
+            let world_x = true_x + (ox * cos - oz * sin) as f64;
+            let world_z = true_z + (ox * sin + oz * cos) as f64;
+            sample(world_x, world_z)
+        })
+        .fold(f32::INFINITY, f32::min)
+        - shared::buildings::FOOTPRINT_BURY_MARGIN
 }
 
 fn spawn_building_from_row(commands: &mut Commands, origin: &WorldOrigin, row: &BuildingRow) {
@@ -240,6 +312,7 @@ fn spawn_building_from_row(commands: &mut Commands, origin: &WorldOrigin, row: &
     spawn_building(
         commands,
         origin,
+        row.id,
         kind,
         row.owner_player_id,
         row.true_x,
@@ -261,13 +334,13 @@ fn spawn_building_from_row(commands: &mut Commands, origin: &WorldOrigin, row: &
 fn apply_place_building(
     place: On<FromClient<PlaceBuildingMsg>>,
     identities: Res<PlayerIdentities>,
+    positions: Res<PlayerPositions>,
     origin: Res<WorldOrigin>,
     noise: Res<TerrainNoise>,
     rapier_context: ReadRapierContext,
     mut wallets: ResMut<Wallets>,
     persistence: Res<Persistence>,
     mut commands: Commands,
-    cars: Query<(&OwnedBy, &Transform)>,
 ) {
     let Some(client_entity) = place.client_id.entity() else {
         return;
@@ -277,19 +350,29 @@ fn apply_place_building(
         return;
     };
 
-    // The sender's own car's current *true* position (not the local
-    // Transform directly — those are only equal before the world's first
-    // rebase, see WorldOrigin's docs), to bound how far "where I am" is
-    // allowed to claim to be.
-    let Some((_, car_transform)) = cars.iter().find(|(owner, _)| owner.0 == client_entity) else {
-        return;
-    };
-    let car_true = origin.to_true(car_transform.translation);
-    let dx = place.true_x - car_true.x;
-    let dz = place.true_z - car_true.z;
-    if (dx * dx + dz * dz).sqrt() > MAX_PLACEMENT_DISTANCE {
-        warn!("economy: rejected placement — too far from the sender's own car");
-        return;
+    // Bound how far "where I am" is allowed to claim to be, against
+    // wherever the player *actually* is (`PlayerPositions`, updated every
+    // tick from `PlayerPositionMsg` — car, plane, or on foot alike, see
+    // that message's own docs). Used to check against a parked car's or
+    // plane's position instead, which broke the instant you stepped away
+    // from either — reported live as "I can't build when I exit my
+    // plane," since the distance was being measured from the vehicle you
+    // just left, not from you.
+    //
+    // No position yet at all only happens in the brief window right after
+    // login before the client's first `PlayerPositionMsg` has arrived —
+    // skipping the check entirely in that one case (rather than rejecting
+    // every such placement outright) is what lets a brand-new player place
+    // their very first building using `STARTING_ENERGY`/`STARTING_ORE`
+    // moments after connecting, rather than racing a message that hasn't
+    // landed yet.
+    if let Some((true_x, true_z)) = positions.get(player_id) {
+        let dx = place.true_x - true_x;
+        let dz = place.true_z - true_z;
+        if (dx * dx + dz * dz).sqrt() > MAX_PLACEMENT_DISTANCE {
+            warn!("economy: rejected placement — too far from the sender's own position");
+            return;
+        }
     }
 
     if place.kind.requires_deposit() && !is_near_deposit(place.true_x, place.true_z) {
@@ -314,13 +397,19 @@ fn apply_place_building(
 
     let building_id = Uuid::new_v4();
     let build_complete_at = now_unix() + place.kind.build_time_secs() as f64;
-    let ground_y = match rapier_context.single() {
-        Ok(context) => surface_height_at(context, &noise, &origin, place.true_x, place.true_z),
-        Err(_) => height_at(&noise, place.true_x, place.true_z),
-    };
+    let ground_y = settle_ground_y(
+        rapier_context.single().ok(),
+        &noise,
+        &origin,
+        place.kind,
+        place.true_x,
+        place.true_z,
+        place.rotation_y,
+    );
     spawn_building(
         &mut commands,
         &origin,
+        building_id,
         place.kind,
         player_id,
         place.true_x,
@@ -341,47 +430,39 @@ fn apply_place_building(
     }));
 }
 
-/// Teleports the sender's own car to their own completed Hangar — the
-/// simplified v1 Hangar behavior (see the base-building plan's scope
-/// note). Same reset mechanics `car_sim.rs`'s `apply_car_reset` uses
-/// (position/velocity/force reset, `reset_generation` bump), just anchored
-/// at a chosen point instead of "wherever the client's local reset already
-/// searched from."
-fn apply_recall_to_hangar(
-    _recall: On<FromClient<RecallToHangarMsg>>,
+/// Resolves one `DestroyBuildingMsg`: finds the building with that id,
+/// checks the sender actually owns it, despawns it, and deletes its
+/// persisted row so it doesn't come back on the next server restart. No
+/// resource refund — same "no partial refunds if it's ever removed"
+/// stance `BuildingKind::cost`'s own docs already anticipated.
+fn apply_destroy_building(
+    destroy: On<FromClient<DestroyBuildingMsg>>,
     identities: Res<PlayerIdentities>,
-    noise: Res<TerrainNoise>,
-    origin: Res<WorldOrigin>,
-    buildings: Query<&BuildingSnapshot>,
-    mut cars: Query<(&OwnedBy, &mut Transform, &mut Velocity, &mut ExternalForce, &mut CarSnapshot)>,
+    persistence: Res<Persistence>,
+    mut commands: Commands,
+    buildings: Query<(Entity, &BuildingSnapshot)>,
 ) {
-    let Some(client_entity) = _recall.client_id.entity() else {
+    let Some(client_entity) = destroy.client_id.entity() else {
         return;
     };
     let Some(player_id) = identities.get(client_entity) else {
+        warn!("economy: destroy request from an unidentified client — ignoring");
         return;
     };
 
-    let Some(hangar) = buildings.iter().find(|b| {
-        b.kind == BuildingKind::Hangar && b.owner_player_id == player_id && b.build_complete_at <= now_unix()
-    }) else {
+    let Some((entity, snapshot)) =
+        buildings.iter().find(|(_, snapshot)| snapshot.id == destroy.building_id)
+    else {
+        warn!("economy: destroy request for unknown building `{}`", destroy.building_id);
         return;
     };
-
-    let ground_y = height_at(&noise, hangar.true_x, hangar.true_z);
-    let local = (bevy::math::DVec3::new(hangar.true_x, 0.0, hangar.true_z) - origin.offset).as_vec3();
-
-    for (owner, mut transform, mut velocity, mut ext_force, mut snapshot) in &mut cars {
-        if owner.0 != client_entity {
-            continue;
-        }
-        transform.translation = Vec3::new(local.x, ground_y + 2.0, local.z);
-        transform.rotation = Quat::IDENTITY;
-        *velocity = Velocity::zero();
-        *ext_force = ExternalForce::default();
-        snapshot.reset_generation = snapshot.reset_generation.wrapping_add(1);
-        break;
+    if snapshot.owner_player_id != player_id {
+        warn!("economy: rejected destroy — `{player_id}` doesn't own building `{}`", destroy.building_id);
+        return;
     }
+
+    commands.entity(entity).despawn();
+    persistence.send(PersistenceCommand::DeleteBuilding(destroy.building_id));
 }
 
 /// Credits every completed building's owner at `PRODUCTION_TICK_SECS`
@@ -402,7 +483,17 @@ fn tick_production(
     let now = now_unix();
     let dt = PRODUCTION_TICK_SECS;
 
-    let mut changed: Vec<Uuid> = Vec::new();
+    // A `HashSet`, not a `Vec`: a player with several producing buildings
+    // (say, three EnergyGenerators) would otherwise land in here once per
+    // building, and the loop below would fire that many identical
+    // `SaveWallet` commands for the exact same wallet every single tick —
+    // each spawned as its own concurrent task competing for
+    // `persistence.rs`'s fixed-size connection pool (see its own docs on
+    // why saves run concurrently, not sequentially). That's exactly what
+    // was starving the pool and pushing `sqlx::pool::acquire` past its
+    // slow-threshold warning during real play: not "saving 30x/sec," but
+    // saving the same row several times over for no reason every second.
+    let mut changed: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     for building in &buildings {
         if building.build_complete_at > now {
             continue; // still under construction
@@ -414,7 +505,7 @@ fn tick_production(
         let entry = wallets.0.entry(building.owner_player_id).or_insert((STARTING_ENERGY, STARTING_ORE));
         entry.0 += energy_rate * dt;
         entry.1 += ore_rate * dt;
-        changed.push(building.owner_player_id);
+        changed.insert(building.owner_player_id);
     }
 
     for player_id in changed {

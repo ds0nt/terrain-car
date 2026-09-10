@@ -7,80 +7,156 @@ use crate::buildings::BuildingKind;
 use crate::car_physics::CarChassis;
 use crate::combat::Health;
 
-/// Client-only marker: the client inserts this on the car entity it spawns
-/// immediately on connecting, before the server's authoritative car for
-/// that same client has had time to arrive — so the local car appears and
-/// responds to input with zero added network latency (see the "client-side
-/// prediction with server reconciliation" section of the multiplayer plan).
+/// Client-only marker: tags whichever replicated car entity belongs to the
+/// local player, once its `CarChassis::owner_player_id` can be compared
+/// against the local account id (see `client::car::tag_local_car`) — same
+/// reactive "replicate first as an ordinary entity, then tag after the
+/// fact by comparing owner id" shape `LocalPlane`'s own `tag_local_plane`
+/// already uses.
 ///
-/// Requires `Signature::of::<LocalCar>()`, which is bevy_replicon's own
-/// built-in mechanism for exactly this: when the server later spawns the
-/// authoritative car for this client with a matching signature (see
-/// `spawn_car_signature` below), replicon merges it into this same client
-/// entity instead of spawning a visible duplicate "ghost" car.
-///
-/// Carries the client's own renet connection id (see
-/// `bevy_replicon_renet`'s `NetworkId`, which the server can read straight
-/// off the `ConnectedClient` entity — same value the client generated for
-/// itself before ever connecting, so both sides embed it identically with
-/// no extra round trip). This field is *not* cosmetic: `Signature`'s hash
-/// covers a component's full `Hash` impl, and this component was originally
-/// a bare marker with no fields at all — meaning every player's car hashed
-/// to the exact same value. `bevy_replicon`'s internal signature registry
-/// is a single global `hash -> entity` map with no per-client scoping of
-/// its own (it relies on callers giving it an actually-unique hash), so
-/// every second-and-later connection's registration silently collided with
-/// the first and was dropped — the likely cause of two players' cars
-/// getting confused with each other. Embedding a real per-client value
-/// fixes the collision at the root, the same way bevy_replicon's own
-/// "predicting a projectile" example gives its signature uniqueness via a
-/// real field rather than relying on `for_client` scoping alone.
-#[derive(Component, Hash, Clone, Copy)]
-#[require(Signature::of::<LocalCar>())]
-pub struct LocalCar(pub u64);
-
-/// Server-side helper: the signature a newly-connected client's own
-/// authoritative car must carry so it merges into that client's
-/// already-locally-spawned `LocalCar` entity instead of duplicating it.
-/// `network_id` must be that client's own renet connection id (its
-/// `NetworkId` component) so the hash matches what the client computed for
-/// itself — see `LocalCar`'s docs for why this can no longer be a bare
-/// marker.
-pub fn spawn_car_signature(client_entity: Entity, network_id: u64) -> (LocalCar, Signature) {
-    (
-        LocalCar(network_id),
-        Signature::of::<LocalCar>().for_client(client_entity),
-    )
-}
+/// *Not* a client-side-predicted pre-spawn the way this used to work: a car
+/// is no longer a free, guaranteed-to-exist thing every connecting client
+/// could safely guess about upfront (spawn one locally, let bevy_replicon's
+/// `Signature` mechanism merge the server's authoritative echo into it) —
+/// it only exists once its owner's `Hangar` actually completes, which can
+/// happen while that owner isn't even connected. A car has no client-side
+/// prediction at all anymore either, for the same reason a plane never
+/// had any: purely server-authoritative, mirrored from `CarSnapshot` (see
+/// that component's own docs on why).
+#[derive(Component, Clone, Copy)]
+pub struct LocalCar;
 
 /// Sent client -> server every `FixedUpdate` tick with the local player's
-/// current input. Sequence-numbered so the client can track which inputs
-/// the server has actually applied (echoed back in `CarSnapshot`) for
-/// reconciliation, and replay any newer, not-yet-applied inputs after a
-/// correction.
+/// current input, while actively driving. No sequence number and no
+/// client-side prediction/reconciliation at all anymore (see
+/// `CarSnapshot`'s docs) — same "each message fully supersedes the last,
+/// server is sole authority" shape `PlaneInputMsg` already used.
 ///
-/// `Unreliable`: each message fully supersedes the last (only "current
-/// input" matters), so a dropped one is harmless and paying for
-/// retransmission would only add latency for no benefit.
+/// `car_id` names exactly which owned car this drives — a multi-car owner
+/// shares one `owner_player_id` across all of them, so without this the
+/// server has no way to tell which specific one you're sitting in and
+/// (before this field existed) applied every input to all of them at
+/// once, live-reported as "when I join a car it should be the correct
+/// car." See `CarChassis::car_id`'s own docs and `client::pilot`'s
+/// `DrivingCarId`.
+///
+/// `Unreliable`: a dropped one is harmless and paying for retransmission
+/// would only add latency for no benefit.
 #[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct CarInputMsg {
-    pub sequence: u32,
+    pub car_id: Uuid,
     pub throttle: f32,
     pub steer: f32,
     pub brake: bool,
     pub boost: bool,
 }
 
-/// Sent client -> server when the player presses R to unstick their car.
-/// The client also applies an identical reset locally, immediately (zero
-/// latency) — this message is what makes the *server's* authoritative
-/// position agree, so a later `CarSnapshot` doesn't read as "a huge desync"
-/// and yank the car back to where it was before the reset (reconciliation
-/// otherwise has no way to know a teleport was intentional). Carries the
-/// search center in true space (rather than a target position) so the
-/// server runs the exact same `find_flat_spawn` search the client already
-/// did — same reasoning as terrain/obstacles never being replicated: two
-/// sides computing the same deterministic answer beats sending it.
+/// Replicated per spawned Scout Plane — see `BuildingKind::AirFactory`'s
+/// docs (one spawns, already owned by the factory's builder, the moment
+/// it completes). Server-authoritative only: no client-side prediction for
+/// a plane you're piloting — every plane, including your own, is just
+/// driven by this replicated snapshot (see
+/// `client::car_render::sync_car_transforms`, which now handles a car
+/// exactly the same way — see `CarSnapshot`'s own docs). That means a
+/// little extra input-to-visible-movement latency while flying compared to
+/// the old locally-predicted driving feel, an acceptable v1 tradeoff for
+/// not needing a full prediction/reconciliation pipeline that a
+/// multi-owned vehicle can't cleanly support anyway (see `CarSnapshot`'s
+/// docs on why that pipeline was removed from cars too).
+#[derive(Component, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct PlaneSnapshot {
+    pub owner_player_id: Uuid,
+    /// Unique per plane, unlike `owner_player_id` which every plane a
+    /// player owns shares — same purpose as `CarChassis::car_id`: the
+    /// actual key `PlaneInputMsg`/`RecallPlaneMsg` target, so flying or
+    /// recalling one specific owned plane doesn't affect every other one
+    /// a multi-plane owner has parked elsewhere. Generated once at spawn
+    /// and never changed.
+    pub plane_id: Uuid,
+    pub true_x: f64,
+    pub true_z: f64,
+    pub altitude: f32,
+    pub rotation: Quat,
+    /// Carried alongside position so a client can show real speed/altitude-
+    /// rate HUD readouts for whichever vehicle it's actually occupying
+    /// (see `client::pilot::PlayerFocus`) without guessing one from frame-
+    /// to-frame position deltas.
+    pub linear_velocity: Vec3,
+    /// True-space position this plane recalls to on `RecallPlaneMsg` (`H`)
+    /// — the Air Factory that spawned it, set once at spawn and never
+    /// changed.
+    pub home_true_x: f64,
+    pub home_true_z: f64,
+}
+
+/// Sent client -> server every `FixedUpdate` tick while the sender is
+/// piloting their own plane (see client's `aircraft.rs`) — same "each
+/// message fully supersedes the last, nothing here ever reconciles/replays"
+/// shape `CarInputMsg` uses (see `PlaneSnapshot`'s/`CarSnapshot`'s docs).
+///
+/// `plane_id` names exactly which owned plane this flies — see
+/// `PlaneSnapshot::plane_id`'s docs and `CarInputMsg::car_id`'s (the
+/// identical fix for cars): without it, a multi-plane owner's input
+/// applied to every owned plane at once, reported live as flying one
+/// appearing to move all of them.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct PlaneInputMsg {
+    pub plane_id: Uuid,
+    /// Forward/back thrust along the plane's own current facing.
+    pub throttle: f32,
+    /// Rudder — turn rate around the plane's own local up axis.
+    pub yaw: f32,
+    /// Elevator — rotation rate around the plane's own local right axis
+    /// (nose up/down). Climbing/descending comes from thrust following the
+    /// tilted nose, same as a real aircraft, not a separate direct
+    /// vertical control — see `server::aircraft::fly_planes`.
+    pub pitch: f32,
+    /// Ailerons — rotation rate around the plane's own local forward axis
+    /// (banking left/right).
+    pub roll: f32,
+}
+
+/// Sent client -> server every `FixedUpdate` tick, unconditionally,
+/// regardless of `ControlMode` — the server-side counterpart to
+/// `client::pilot::PlayerFocus`: "wherever the player actually is right
+/// now," car, plane, or on foot alike. Exists because distance-bound
+/// server actions (`PlaceBuildingMsg`'s "close enough to place this")
+/// otherwise have no way to know that at all while on foot — the on-foot
+/// avatar is client-local only (see `pilot.rs`'s own docs), never
+/// replicated, so unlike a car or plane the server has *no* independent
+/// position for it whatsoever without this. Using the parked vehicle's
+/// position instead (the previous approach) actively broke placement the
+/// moment you stepped away from it — reported live as "I can't build when
+/// I exit my plane." True-space, not local — same reasoning every other
+/// position-bearing message here already uses.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct PlayerPositionMsg {
+    pub true_x: f64,
+    pub true_z: f64,
+    /// Facing, in the same "atan2(x, z)" bearing convention every other
+    /// facing calculation in this game already uses (see
+    /// `building_placement.rs`'s own docs) — only actually meaningful
+    /// while `on_foot` (a car/plane's own facing already replicates via
+    /// `CarSnapshot`/`PlaneSnapshot`), but always sent so this message's
+    /// shape doesn't need to change if that ever stops being true.
+    pub rotation_y: f32,
+    /// Whether the sender is currently on foot (`ControlMode::OnFoot`) —
+    /// the server mirrors this straight onto `PlayerOnFootSnapshot` so
+    /// every other client can tell whether to actually render this
+    /// player's on-foot avatar or not: this message keeps arriving
+    /// unconditionally regardless of mode (see this struct's own docs),
+    /// so without an explicit flag every other client would have no way
+    /// to tell "on foot, not moving" from "driving, and this position is
+    /// stale" and might render a duplicate avatar overlapping a car.
+    pub on_foot: bool,
+}
+
+/// Sent client -> server when the player presses R to unstick their car —
+/// the server does the actual work (find flat ground, reposition, zero
+/// velocity) and the client just waits for the result to replicate back,
+/// same "ask, don't locally guess" shape every car message uses now (see
+/// `CarSnapshot`'s docs). Carries the search center in true space so the
+/// server can bias `find_flat_spawn` near wherever the player actually is.
 #[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct CarResetMsg {
     pub near_true_x: f64,
@@ -91,26 +167,83 @@ pub struct CarResetMsg {
 /// data component rather than Rapier's own `Transform`/`Velocity` types, so
 /// `shared` (and the headless server) never need to depend on bevy_rapier3d
 /// or rendering machinery just to describe "where is this car and how fast
-/// is it moving." `last_input_sequence` is the reconciliation anchor: the
-/// client compares its own predicted state at that same sequence number
-/// against this snapshot to decide whether, and how hard, to correct.
+/// is it moving."
 ///
-/// `reset_generation` is bumped by the server every time it processes a
-/// `CarResetMsg` for this car. The client remembers the generation at which
-/// *it* last reset locally and ignores any snapshot older than that — those
-/// necessarily reflect the car's pre-reset position, arriving after the
-/// local reset just because of ordinary network latency. Without this, a
-/// stale snapshot would look exactly like a huge, real desync and get
-/// corrected against, yanking the car back to where it was before you
-/// pressed R.
+/// No client-side prediction/reconciliation reads this anymore (a car used
+/// to carry a `last_input_sequence`/`reset_generation` pair purely to
+/// support that, both removed along with it) — a car is purely server-
+/// authoritative now, driven only by this snapshot, exactly like
+/// `PlaneSnapshot` always was. That wasn't just a simplification: a
+/// player can own several cars (full parity with owning several planes),
+/// and client-side prediction/reconciliation fundamentally assumes there's
+/// exactly one locally-predicted body to reconcile against — every extra
+/// owned car would either need its own independent prediction state (a
+/// real multi-body reconciliation system this project never needed for
+/// planes) or silently not be reconciled at all. Dropping prediction
+/// entirely sidesteps that instead of half-solving it.
 #[derive(Component, Serialize, Deserialize, Clone, Copy, Debug, Default)]
 pub struct CarSnapshot {
     pub translation: Vec3,
     pub rotation: Quat,
     pub linear_velocity: Vec3,
     pub angular_velocity: Vec3,
-    pub last_input_sequence: u32,
-    pub reset_generation: u32,
+    /// True-space position this car recalls to on `RecallToHangarMsg` (`H`)
+    /// — the Hangar that spawned it, set once at spawn and never changed,
+    /// same "remembers its own home" shape `PlaneSnapshot`'s
+    /// `home_true_x`/`home_true_z` use for a plane's Air Factory.
+    pub home_true_x: f64,
+    pub home_true_z: f64,
+    /// Who's riding along as a passenger right now, if anyone — `None`
+    /// means the seat is empty. Set/cleared by
+    /// `server::car_sim::apply_board_passenger`/`apply_exit_passenger` in
+    /// response to `BoardPassengerMsg`/`ExitPassengerMsg`, *not*
+    /// recomputed every physics tick the way `translation`/`rotation` are
+    /// (see `server::car_sim`'s per-tick sync, which only ever touches
+    /// those four fields) — a passenger has no physics of their own to
+    /// derive this from, it's pure seat-occupancy state. Deliberately not
+    /// restricted to the car's own owner: riding along in a friend's car
+    /// is the whole point.
+    pub passenger_player_id: Option<Uuid>,
+}
+
+/// Sent client -> server when the pilot of `plane_id` exits it (`E`) —
+/// separate from the zeroed `PlaneInputMsg` also sent on exit
+/// (`client::pilot`'s `handle_vehicle_key`), which only stops *future*
+/// thrust; a plane has no gravity to eventually settle it and only modest
+/// linear damping (see `PLANE_LINEAR_DAMPING`), so without this a plane
+/// exited mid-glide would keep coasting under leftover momentum for a
+/// while rather than actually stopping — reported live as "once you exit
+/// the plane it needs to have its engines cut." The server-side handler
+/// (`server::aircraft`'s `apply_exit_plane`) zeroes `Velocity` and
+/// `ExternalForce` directly, an immediate hard stop rather than a fast
+/// damped decay.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct ExitPlaneMsg {
+    pub plane_id: Uuid,
+}
+
+/// Sent client -> server when a player on foot boards a car as a
+/// passenger (`E`, near a car whose `CarSnapshot::passenger_player_id` is
+/// currently `None` — see `client::pilot`'s `handle_vehicle_key`). Unlike
+/// `CarInputMsg`, there's no ownership check: any car with an empty seat
+/// can be ridden, driven by its owner or not.
+///
+/// `Ordered`, not `Unreliable` like `CarInputMsg` — this is a one-shot
+/// state transition (empty seat -> occupied), not a continuously-repeated
+/// value where a dropped packet is instantly superseded by the next one;
+/// losing it silently would leave the passenger's own client thinking
+/// they boarded while the server never learned the seat was taken.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct BoardPassengerMsg {
+    pub car_id: Uuid,
+}
+
+/// Sent client -> server when the current passenger of `car_id` presses
+/// `E` again to get out — see `BoardPassengerMsg`'s docs on why this is
+/// `Ordered` for the same reason.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct ExitPassengerMsg {
+    pub car_id: Uuid,
 }
 
 /// Sent client -> server when the player presses R to right a flipped car
@@ -186,6 +319,15 @@ pub struct AuthResultMsg {
     pub ok: bool,
     pub player_id: Option<Uuid>,
     pub message: String,
+    /// True-space spot the server picked for this login (near other
+    /// connected players, or the starter villager it just spawned nearby —
+    /// see `server::car_sim::pick_spawn_point`) — meaningless when `ok` is
+    /// `false`. The player now starts on foot with no car to predict a
+    /// position from, so the client needs to be *told* where "here" is
+    /// rather than guessing it locally (see `client::pilot`'s
+    /// `spawn_pilot_after_login`).
+    pub spawn_true_x: f64,
+    pub spawn_true_z: f64,
 }
 
 /// Sent client -> server when the player fires the front-mounted gun.
@@ -295,6 +437,28 @@ pub struct VillagerSnapshot {
     pub true_z: f64,
 }
 
+/// Mirrors the sender's own server-side villager build queue
+/// (`server::villagers`'s `VillagerQueues`) onto their car — same "server
+/// holds the real authoritative state, a component on the car is just how
+/// it reaches clients" relationship `Wallet` already has, and for the same
+/// reason: it changes over time (queueing, and every time a queued
+/// villager actually finishes spawning) and every client watching this
+/// player's Land Factory panel needs to see that.
+#[derive(Component, Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct VillagerQueue {
+    pub queued: u32,
+}
+
+/// Sent client -> server when the player queues one more villager build at
+/// one of their own Land Factories (see client's `building_ui.rs`, shown
+/// for a selected, owned `LandFactory`). Carries no specific building:
+/// like `RecallToHangarMsg`, the server already knows whose queue this is,
+/// and every one of a player's completed Land Factories draws from that
+/// same shared queue (see `server::villagers`) — there's nothing else to
+/// identify.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct QueueVillagerMsg;
+
 /// Sent client -> server to place a building. `true_x`/`true_z` is where
 /// the player wants it (their car's current position — see client's
 /// `building_ui.rs`); the server is the sole authority on whether it's
@@ -314,6 +478,18 @@ pub struct PlaceBuildingMsg {
     pub rotation_y: f32,
 }
 
+/// Sent client -> server to destroy one of the sender's own buildings —
+/// see client's `building_ui.rs` (the trash-icon button on a selected,
+/// owned building, requiring a second confirming click). `building_id` is
+/// `BuildingSnapshot::id`, not the replicated `Entity` — see that field's
+/// own docs on why. The server is the sole authority on whether the
+/// sender actually owns it; a client can *ask* to destroy any id, but
+/// only ever succeeds against its own.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct DestroyBuildingMsg {
+    pub building_id: Uuid,
+}
+
 /// Replicated per placed building — every client sees every player's
 /// buildings, not just their own. `build_complete_at` is a real Unix-epoch
 /// timestamp (seconds, matching `server::persistence`'s own choice of
@@ -325,6 +501,13 @@ pub struct PlaceBuildingMsg {
 /// its own current Unix time is earlier than this.
 #[derive(Component, Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct BuildingSnapshot {
+    /// Stable identity, independent of the per-client/per-server `Entity`
+    /// replication assigns — the same id `server::persistence` already
+    /// generates for this building's DB row, just also carried on the
+    /// live entity now so a client can name *this specific building* in a
+    /// message back to the server (`DestroyBuildingMsg`) without needing
+    /// entity-id network mapping.
+    pub id: Uuid,
     pub kind: BuildingKind,
     pub owner_player_id: Uuid,
     pub true_x: f64,
@@ -344,13 +527,40 @@ pub struct BuildingSnapshot {
     pub ground_y: f32,
 }
 
-/// Sent client -> server: teleport the sender's own car to their Hangar —
-/// the simplified v1 Hangar behavior (see the base-building plan's scope
-/// note on why this isn't a multi-car garage yet). No payload: like
-/// `RegenRequestMsg`, the server already knows both who's asking and,
-/// once it looks up their `Hangar`, where "their Hangar" actually is.
+/// Sent client -> server: teleport the sender's currently-driven car
+/// (`car_id`, see `CarChassis::car_id`'s docs) to whichever owned `Hangar`
+/// is nearest right now — `H`, same key `RecallPlaneMsg` uses for a plane.
+/// Deliberately *not* "back to `CarSnapshot::home_true_x`/`home_true_z`"
+/// (the original design, and still the fallback if every owned Hangar has
+/// since been destroyed): reported live as wanting the *nearest* Hangar,
+/// not necessarily the specific one this car happened to spawn from,
+/// which may by now be far away, or gone.
 #[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
-pub struct RecallToHangarMsg;
+pub struct RecallToHangarMsg {
+    pub car_id: Uuid,
+}
+
+/// Sent client -> server: teleport the sender's currently-flown plane
+/// (`plane_id`, see `PlaneSnapshot::plane_id`'s docs) back to wherever it
+/// spawned (`PlaneSnapshot::home_true_x`/`home_true_z`) — `H`, same key
+/// `RecallToHangarMsg` uses for a car. Needs `plane_id` for the same
+/// reason `RecallToHangarMsg` needs `car_id`: without it, recall moved
+/// every owned plane at once instead of just the one being flown.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct RecallPlaneMsg {
+    pub plane_id: Uuid,
+}
+
+/// Sent client -> server: `H` while on foot (see client's
+/// `building_ui.rs`) — recalls the *player themself*, not a car or plane
+/// (`RecallToHangarMsg`/`RecallPlaneMsg` are for those), to whichever
+/// owned Hangar, Land Factory, or Air Factory is nearest right now — any
+/// of the three, unlike the car/plane recalls, which only ever look at
+/// their own matching kind of building. No payload: the server already
+/// knows who's asking and where they currently are
+/// (`server::car_sim::PlayerPositions`).
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct RecallPlayerMsg;
 
 /// Who owns this car, replicated alongside everything else on the same
 /// entity — lets every client build a "who's currently connected" list
@@ -363,6 +573,32 @@ pub struct RecallToHangarMsg;
 pub struct PlayerInfo {
     pub player_id: Uuid,
     pub username: String,
+}
+
+/// Mirrors the sender's own `PlayerPositionMsg` onto their account entity
+/// (the same one `PlayerInfo`/`Wallet` already live on) purely so it
+/// replicates — the on-foot avatar itself is still client-local-only for
+/// *the player controlling it* (see `client::pilot`'s top-level docs on
+/// why: no server-side physics for it, just an authoritative position),
+/// but every *other* client can now render a stand-in for it, the same
+/// "server holds the real state, this component is just how it reaches
+/// clients" relationship `Wallet`/`CarCosmetics` already have. Before this
+/// existed, a player walking around on foot was invisible to everyone else
+/// in every sense — no rendered avatar, no minimap dot, no
+/// `player_markers.rs` nametag — since there was nothing at all replicated
+/// about on-foot state; only a parked vehicle was ever visible.
+#[derive(Component, Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct PlayerOnFootSnapshot {
+    pub true_x: f64,
+    pub true_z: f64,
+    pub rotation_y: f32,
+    /// `false` whenever the sender is actually driving/flying/riding —
+    /// see `PlayerPositionMsg::on_foot`'s own docs on why this has to be
+    /// explicit rather than inferred. Every renderer of this component
+    /// (`client::remote_players`, `player_markers.rs`, `minimap.rs`) skips
+    /// entirely whenever this is `false`, rather than trying to render a
+    /// stale/meaningless position.
+    pub on_foot: bool,
 }
 
 /// Sent client -> server to ping a location for every other player — no
@@ -385,6 +621,77 @@ pub struct PingBroadcastMsg {
     pub true_z: f64,
 }
 
+/// Sent client -> server to redirect an AI-controlled car's patrol point
+/// (right-click while it's selected — see client's `selection.rs`).
+/// `car_id` is `CarChassis::car_id`, matched the same way every other
+/// per-vehicle message here already is; the server is the sole authority
+/// on whether that car is actually AI-controlled at all
+/// (`server::ai::AI_OWNER`) — naming a real player's own car here simply
+/// matches nothing, the identical "visible via replication but harmless to
+/// name" reasoning `CarInputMsg`'s own docs already cover.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct SetCarPatrolMsg {
+    pub car_id: Uuid,
+    pub target_true_x: f64,
+    pub target_true_z: f64,
+}
+
+/// Same as `SetCarPatrolMsg`, for an AI-controlled plane.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct SetPlanePatrolMsg {
+    pub plane_id: Uuid,
+    pub target_true_x: f64,
+    pub target_true_z: f64,
+}
+
+/// Sent client -> server whenever the player sends a chat line (Enter, see
+/// client's `chat.rs`) — carries the raw typed text. The server is the sole
+/// authority on what happens next: an ordinary line gets broadcast back out
+/// as a `ChatBroadcastMsg` to everyone, while a `/`-prefixed line is parsed
+/// as a command (`/tp`, `/respawn` — see `server::chat`) and never
+/// broadcast at all, same "client sends intent, server decides" trust
+/// boundary every other message here already enforces. `Ordered`: chat
+/// lines must never reorder or silently drop the way an `Unreliable`
+/// message could.
+#[derive(Event, Serialize, Deserialize, Clone, Debug)]
+pub struct ChatMsg {
+    pub text: String,
+}
+
+/// Sent server -> clients whenever a chat line should be shown — either
+/// broadcast to everyone (an ordinary message) or privately to a single
+/// client (a command's own feedback/errors, or a heads-up that someone
+/// teleported you — see `server::chat`). `player_id` is `None` for a
+/// server-originated system line, which the client renders distinctly (a
+/// "server" label, no owner color) rather than trying to look up a
+/// nonexistent player for it.
+#[derive(Event, Serialize, Deserialize, Clone, Debug)]
+pub struct ChatBroadcastMsg {
+    pub player_id: Option<Uuid>,
+    pub username: String,
+    pub text: String,
+}
+
+/// Sent server -> a single client to force-reposition whatever on-foot
+/// avatar they currently have — the on-foot half of `/tp`/`/respawn` (see
+/// `server::chat`). Cars and planes need no such message at all: both are
+/// already fully server-authoritative (`CarSnapshot`/`PlaneSnapshot`), so
+/// `server::chat` simply writes their `Transform`/`Velocity` directly the
+/// same way `apply_car_reset`/`apply_recall_plane` already do, for every
+/// car/plane the teleported player owns. This message exists purely to
+/// also relocate the on-foot avatar, which (unlike a car or plane) has no
+/// server-side entity of its own at all — see `PlayerPositionMsg`'s docs on
+/// why. Harmless no-op if the receiving client has no on-foot avatar to
+/// move right now (driving/flying/riding instead) — see client's
+/// `chat::apply_teleport`, which just does nothing in that case; whatever
+/// they're occupying was already moved directly, and they'll see this same
+/// position reflected whenever they later step out of it.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct TeleportMsg {
+    pub true_x: f64,
+    pub true_z: f64,
+}
+
 /// Registers everything that must be identical between client and server:
 /// which components replicate (and how often), and the client -> server /
 /// server -> client event channels. Both binaries call this exact function
@@ -402,8 +709,14 @@ pub fn register_protocol(app: &mut App) {
         // to see it live, not just once at spawn.
         .replicate::<Health>()
         .add_client_event::<CarInputMsg>(Channel::Unreliable)
+        .replicate::<PlaneSnapshot>()
+        .add_client_event::<PlaneInputMsg>(Channel::Unreliable)
+        .add_client_event::<PlayerPositionMsg>(Channel::Unreliable)
         .add_client_event::<CarResetMsg>(Channel::Ordered)
         .add_client_event::<FlipUprightMsg>(Channel::Ordered)
+        .add_client_event::<BoardPassengerMsg>(Channel::Ordered)
+        .add_client_event::<ExitPassengerMsg>(Channel::Ordered)
+        .add_client_event::<ExitPlaneMsg>(Channel::Ordered)
         .add_client_event::<RegenRequestMsg>(Channel::Ordered)
         .add_client_event::<FireGunMsg>(Channel::Unreliable)
         .add_server_event::<GunFiredMsg>(Channel::Unreliable)
@@ -415,11 +728,22 @@ pub fn register_protocol(app: &mut App) {
         .add_client_event::<SetCosmeticsMsg>(Channel::Ordered)
         .replicate::<BuildingSnapshot>()
         .replicate::<VillagerSnapshot>()
+        .replicate::<VillagerQueue>()
         .add_client_event::<PlaceBuildingMsg>(Channel::Ordered)
+        .add_client_event::<DestroyBuildingMsg>(Channel::Ordered)
         .add_client_event::<RecallToHangarMsg>(Channel::Ordered)
+        .add_client_event::<RecallPlaneMsg>(Channel::Ordered)
+        .add_client_event::<RecallPlayerMsg>(Channel::Ordered)
+        .add_client_event::<QueueVillagerMsg>(Channel::Ordered)
         .replicate::<PlayerInfo>()
+        .replicate::<PlayerOnFootSnapshot>()
         .add_client_event::<PingMsg>(Channel::Unreliable)
         .add_server_event::<PingBroadcastMsg>(Channel::Unreliable)
+        .add_client_event::<SetCarPatrolMsg>(Channel::Ordered)
+        .add_client_event::<SetPlanePatrolMsg>(Channel::Ordered)
+        .add_client_event::<ChatMsg>(Channel::Ordered)
+        .add_server_event::<ChatBroadcastMsg>(Channel::Ordered)
+        .add_server_event::<TeleportMsg>(Channel::Ordered)
         .add_server_event::<WorldRegenMsg>(Channel::Ordered)
         // Unreliable: purely cosmetic, and another strike is at most 10s
         // away anyway, so a dropped one is never worth retransmitting.

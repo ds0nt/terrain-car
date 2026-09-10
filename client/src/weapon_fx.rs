@@ -94,11 +94,12 @@ struct LocalFireCooldown {
 fn send_fire_input(
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
+    chat_open: Res<crate::chat::ChatOpen>,
     mut cooldown: ResMut<LocalFireCooldown>,
     mut commands: Commands,
 ) {
     cooldown.remaining = (cooldown.remaining - time.delta_secs()).max(0.0);
-    if !keyboard.pressed(KeyCode::KeyF) || cooldown.remaining > 0.0 {
+    if chat_open.0 || !keyboard.pressed(KeyCode::KeyF) || cooldown.remaining > 0.0 {
         return;
     }
     cooldown.remaining = FIRE_COOLDOWN_SECS;

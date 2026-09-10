@@ -1,3 +1,4 @@
+mod aircraft;
 mod auth_ui;
 mod building_placement;
 mod building_render;
@@ -5,6 +6,7 @@ mod building_ui;
 mod camera;
 mod car;
 mod car_render;
+mod chat;
 mod cosmetics_ui;
 mod fx;
 mod hud;
@@ -13,11 +15,16 @@ mod lightning_fx;
 mod minimap;
 mod net;
 mod owner_color;
+mod pilot;
 mod pings;
+mod player_account;
+mod player_markers;
 mod players_ui;
-mod prediction;
 mod recorder;
-mod tectonic;
+mod remote_players;
+mod selection;
+mod settings;
+mod stars;
 mod terrain;
 mod terrain_material;
 mod villager_render;
@@ -33,7 +40,12 @@ fn main() {
     let mut app = App::new();
 
     app.init_resource::<net::LocalClientId>()
-        .insert_resource(ClearColor(Color::srgb(0.55, 0.75, 0.95)))
+        // A near-black, faint red-tinted night sky (was a bright daytime
+        // blue) — wherever the atmosphere/skybox doesn't cover, this is
+        // what shows, and a bright clear color there would fight the
+        // Mars-at-night look (`lighting.rs`) no matter how dark the actual
+        // sun/ambient light are set.
+        .insert_resource(ClearColor(Color::srgb(0.02, 0.015, 0.02)))
         // `TimestepMode` is a standalone global resource (not a field of
         // `RapierConfiguration`), and `RapierPhysicsPlugin::build()` only
         // `init_resource`s it (won't overwrite an existing value) — so
@@ -60,7 +72,6 @@ fn main() {
             terrain::TerrainPlugin,
             car::CarPlugin,
             car_render::CarRenderPlugin,
-            prediction::PredictionPlugin,
             camera::CameraPlugin,
             lighting::LightingPlugin,
             hud::HudPlugin,
@@ -71,7 +82,6 @@ fn main() {
         .add_plugins((
             minimap::MinimapPlugin,
             recorder::RecorderPlugin,
-            tectonic::TectonicPlugin,
             fx::FxPlugin,
             lightning_fx::LightningFxPlugin,
             bevy_hanabi::HanabiPlugin,
@@ -79,10 +89,26 @@ fn main() {
             building_ui::BuildingUiPlugin,
             building_render::BuildingRenderPlugin,
             building_placement::BuildingPlacementPlugin,
+            selection::SelectionPlugin,
             villager_render::VillagerRenderPlugin,
             auth_ui::AuthUiPlugin,
         ))
-        .add_plugins((pings::PingsPlugin, players_ui::PlayersUiPlugin, cosmetics_ui::CosmeticsUiPlugin));
+        .add_plugins((
+            pings::PingsPlugin,
+            players_ui::PlayersUiPlugin,
+            player_markers::PlayerMarkersPlugin,
+            cosmetics_ui::CosmeticsUiPlugin,
+            aircraft::AircraftPlugin,
+            pilot::PilotPlugin,
+            player_account::PlayerAccountPlugin,
+            stars::StarsPlugin,
+            chat::ChatPlugin,
+            remote_players::RemotePlayersPlugin,
+            settings::SettingsPlugin,
+            // Feeds `hud.rs`'s FPS readout — `DiagnosticsStore` stays empty
+            // without this registered somewhere.
+            bevy::diagnostic::FrameTimeDiagnosticsPlugin::default(),
+        ));
 
     // Registers replicated components/events — must use the exact same
     // function the server calls, so wire IDs (assigned in registration

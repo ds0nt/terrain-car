@@ -1,5 +1,8 @@
+mod ai;
+mod aircraft;
 mod auth;
 mod car_sim;
+mod chat;
 mod console;
 mod economy;
 mod lightning;
@@ -72,7 +75,7 @@ fn main() {
         economy::EconomyPlugin,
         villagers::VillagersPlugin,
     ))
-    .add_plugins((auth::AuthPlugin, pings::PingsPlugin));
+    .add_plugins((chat::ChatPlugin, auth::AuthPlugin, pings::PingsPlugin, aircraft::AircraftPlugin, ai::AiPlugin));
 
     // Registers replicated components/events — must use the exact same
     // function the client calls, so wire IDs (assigned in registration

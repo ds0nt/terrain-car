@@ -1,12 +1,17 @@
 use bevy::prelude::*;
 use bevy_replicon::prelude::*;
-use bevy_replicon::shared::backend::connected_client::NetworkId;
 use shared::auth::{validate_password, validate_username};
-use shared::protocol::{AuthResultMsg, LoginMsg, RegisterMsg, Wallet};
+use shared::protocol::{
+    AuthResultMsg, LoginMsg, PlayerInfo, PlayerOnFootSnapshot, RegisterMsg, VillagerQueue, Wallet, WorldRegenMsg,
+};
 use shared::terrain_gen::TerrainNoise;
 use shared::worldspace::WorldOrigin;
 
-use crate::car_sim::{spawn_car_for, CurrentWorldState, PlayerIdentities, PlayerRegistry, SpawnAnchor};
+use bevy::math::DVec3;
+use crate::car_sim::{
+    pick_spawn_point, CurrentWorldState, OwnedBy, PlayerIdentities, PlayerPositions, PlayerRegistry,
+    SpawnAnchor,
+};
 use crate::economy::Wallets;
 use crate::persistence::{AuthOutcome, Persistence, PersistenceCommand, WalletRow};
 use crate::villagers::{spawn_villager_for_new_player, VillagerAi};
@@ -89,10 +94,25 @@ fn apply_login(login: On<FromClient<LoginMsg>>, mut commands: Commands, persiste
 fn reject(commands: &mut Commands, client_entity: Entity, message: &str) {
     commands.server_trigger(ToClients {
         targets: SendTargets::Single(ClientId::Client(client_entity)),
-        message: AuthResultMsg { ok: false, player_id: None, message: message.to_string() },
+        message: AuthResultMsg {
+            ok: false,
+            player_id: None,
+            message: message.to_string(),
+            spawn_true_x: 0.0,
+            spawn_true_z: 0.0,
+        },
     });
 }
 
+/// On success, spawns this connection's `PlayerAccount` entity — `Wallet`,
+/// `PlayerInfo`, `VillagerQueue`, ephemeral-per-connection via `OwnedBy`
+/// exactly like a car used to be (see `car_sim::despawn_player_on_disconnect`).
+/// No car spawns here at all anymore: a car is something you build (a
+/// completed `Hangar`, see `car_sim::spawn_cars_from_hangars`), not a free
+/// login gift — the player starts on foot, at the same spot this picks for
+/// the starter villager, which the response's `spawn_true_x`/`spawn_true_z`
+/// tells the client so it can place the on-foot avatar there too (see
+/// `client::pilot`'s `spawn_pilot_after_login`).
 #[allow(clippy::too_many_arguments)]
 fn apply_auth_outcome(
     mut commands: Commands,
@@ -105,8 +125,8 @@ fn apply_auth_outcome(
     registry: Res<PlayerRegistry>,
     mut anchor: ResMut<SpawnAnchor>,
     world_state: Res<CurrentWorldState>,
-    network_ids: Query<&NetworkId>,
     villagers: Query<&VillagerAi>,
+    positions: Res<PlayerPositions>,
 ) {
     for event in events.read() {
         let client_entity = event.client_entity;
@@ -119,18 +139,14 @@ fn apply_auth_outcome(
             AuthOutcome::Error(e) => (false, None, e.clone()),
         };
 
-        commands.server_trigger(ToClients {
-            targets: SendTargets::Single(ClientId::Client(client_entity)),
-            message: AuthResultMsg {
-                ok,
-                player_id: identity.as_ref().map(|(id, _)| *id),
-                message,
-            },
-        });
-
         let Some((player_id, username)) = identity else {
+            commands.server_trigger(ToClients {
+                targets: SendTargets::Single(ClientId::Client(client_entity)),
+                message: AuthResultMsg { ok, player_id: None, message, spawn_true_x: 0.0, spawn_true_z: 0.0 },
+            });
             continue;
         };
+
         identities.insert(client_entity, player_id);
         let (energy, ore) = wallets.get_or_seed(player_id);
         persistence.send(PersistenceCommand::SaveWallet(WalletRow {
@@ -138,19 +154,56 @@ fn apply_auth_outcome(
             energy: energy as f64,
             ore: ore as f64,
         }));
-        let spawn_true = spawn_car_for(
-            &mut commands,
-            &noise,
-            &origin,
-            &registry,
-            &mut anchor,
-            &world_state,
-            &network_ids,
-            client_entity,
-            player_id,
-            username,
+
+        let index = registry
+            .index_for(client_entity)
+            .unwrap_or_else(|| panic!("client `{client_entity}` logged in without ever connecting"));
+        // A returning player resumes wherever `PlayerPositionMsg` last saw
+        // them (loaded from Postgres at startup, or updated live if they've
+        // been online since — see `car_sim::PlayerPositions`); a genuinely
+        // new player has no entry yet, so falls back to a freshly computed
+        // spawn-anchor point exactly as before.
+        let spawn_true = match positions.get(player_id) {
+            Some((true_x, true_z)) => DVec3::new(true_x, 0.0, true_z),
+            None => pick_spawn_point(index, &mut anchor, &noise, &origin),
+        };
+
+        commands.spawn((
+            OwnedBy(client_entity),
+            Replicated,
+            PlayerInfo { player_id, username },
             Wallet { energy, ore },
-        );
+            VillagerQueue::default(),
+            // Starts `on_foot: false` (correct — the player hasn't sent a
+            // real `PlayerPositionMsg` yet) — `car_sim::apply_player_position`
+            // fills this in for real the moment one arrives.
+            PlayerOnFootSnapshot::default(),
+        ));
+
+        commands.server_trigger(ToClients {
+            targets: SendTargets::Single(ClientId::Client(client_entity)),
+            message: AuthResultMsg {
+                ok,
+                player_id: Some(player_id),
+                message,
+                spawn_true_x: spawn_true.x,
+                spawn_true_z: spawn_true.z,
+            },
+        });
+
+        // Catch-up: if the world was already regenerated before this client
+        // connected, they'd otherwise never learn the new seed (a broadcast
+        // WorldRegenMsg doesn't retroactively reach clients who weren't
+        // connected when it was sent). Skipped when the world is still on
+        // its untouched default — every fresh client already starts there.
+        if let Some(seed) = world_state.seed {
+            commands.server_trigger(ToClients {
+                targets: SendTargets::Single(ClientId::Client(client_entity)),
+                message: WorldRegenMsg { seed, origin_x: origin.offset.x, origin_z: origin.offset.z },
+            });
+        }
+
+        info!("server: spawned player account for client `{client_entity}` (player #{index})");
         spawn_villager_for_new_player(&mut commands, &villagers, player_id, spawn_true.x, spawn_true.z);
     }
 }

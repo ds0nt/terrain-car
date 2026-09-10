@@ -119,10 +119,17 @@ fn draw_login_window(
             });
 
             ui.horizontal(|ui| {
-                if ui.button("Log In").clicked() {
+                // `Sense::CLICK`, not `ui.button`'s default focusable
+                // sense — mouse-only, same reasoning `building_ui.rs`'s
+                // `building_button` uses, and not merely for consistency:
+                // an earlier, cruder fix for that build-bar issue (see
+                // `chat::clear_stray_ui_focus`'s own docs) briefly broke
+                // this exact password field's ability to even be clicked
+                // into, so these two buttons get the same real fix too.
+                if ui.add(egui::Button::new("Log In").sense(egui::Sense::CLICK)).clicked() {
                     try_submit(&mut state, &mut form, &mut commands, &mut attempted_events, false);
                 }
-                if ui.button("Register").clicked() {
+                if ui.add(egui::Button::new("Register").sense(egui::Sense::CLICK)).clicked() {
                     try_submit(&mut state, &mut form, &mut commands, &mut attempted_events, true);
                 }
             });

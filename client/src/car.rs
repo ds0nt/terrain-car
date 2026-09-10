@@ -1,55 +1,81 @@
-use bevy::math::DVec3;
 use bevy::prelude::*;
-use bevy_rapier3d::prelude::*;
 use bevy_replicon::prelude::ClientTriggerExt;
 pub use shared::car_physics::{CarChassis, CarInput};
-use shared::car_physics::{compute_wheel_forces, Wheel, WheelStepInput};
-use shared::buildings::{STARTING_ENERGY, STARTING_ORE};
-use shared::combat::{Health, DEFAULT_MAX_HEALTH};
 pub use shared::protocol::LocalCar;
-use shared::protocol::{CarCosmetics, Wallet};
-use shared::terrain_gen::{find_flat_spawn, height_at, TerrainNoise};
+use shared::protocol::CarInputMsg;
+use uuid::Uuid;
 
-use crate::auth_ui::LoginAttempted;
-use crate::terrain::{RegenerateWorldEvent, TerrainTracker};
+use crate::terrain::RegenerateWorldEvent;
 use crate::worldspace::WorldOrigin;
-
-/// How far around a candidate spawn point to search for flat ground.
-const SPAWN_SEARCH_RADIUS: f64 = 300.0;
 
 pub struct CarPlugin;
 
 impl Plugin for CarPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CarInput>()
+            .init_resource::<DrivingCarId>()
             .add_message::<CarResetEvent>()
-            .add_systems(
-                Update,
-                (spawn_car_after_login, read_car_input, flip_car_upright, reset_car_after_regen).chain(),
-            )
-            // Physics lives in FixedUpdate (alongside Rapier itself, see
-            // main.rs's `in_fixed_schedule()`) rather than Update, so the
-            // suspension/drive step advances by a constant dt regardless of
-            // render framerate. That determinism is what will let a future
-            // server run the identical step and a client replay buffered
-            // inputs during reconciliation without drifting from render-rate
-            // jitter. `read_car_input`/`reset_car` stay in `Update`: they
-            // only read continuous key state or a `just_pressed` edge, and
-            // FixedUpdate can run zero or several times per rendered frame,
-            // which would either miss that edge or double-fire it.
-            .add_systems(
-                FixedUpdate,
-                car_suspension_and_drive.before(PhysicsSet::SyncBackend),
-            );
+            .add_systems(Update, (tag_local_car, read_car_input, flip_car_upright, reset_car_after_regen).chain())
+            // Sends whatever `read_car_input` gathered this tick — `FixedUpdate`
+            // so it goes out at a steady network rate regardless of render
+            // framerate, the same reasoning `aircraft.rs`'s `send_plane_input`
+            // already uses. There's no local physics step to order this
+            // against anymore (see this module's top-level docs on why): a
+            // car is server-authoritative only now, exactly like a plane.
+            .add_systems(FixedUpdate, send_car_input);
     }
 }
 
-/// Fired the frame the car is reset, so the camera can snap to it instantly
-/// instead of smoothly chasing a car that just teleported across the map.
+/// Which specific owned car (`CarChassis::car_id`) the player is actually
+/// sitting in right now — `None` whenever `ControlMode` isn't `Car`. Set
+/// by `pilot::handle_vehicle_key` on boarding (the *nearest* car within
+/// `ENTER_RADIUS`, not just any owned one) and cleared on exit.
+///
+/// Exists because `owner_player_id` alone can't answer "which one" for a
+/// multi-car owner — `camera.rs`'s chase cam, `hud.rs`'s health readout,
+/// and this module's own `send_car_input` all used to just grab whichever
+/// owned car happened to be first in iteration order, which silently
+/// diverged from whichever car you'd actually walked up to and boarded
+/// the moment you owned more than one — reported live as "when I join a
+/// car it should be the correct car."
+#[derive(Resource, Default, Clone, Copy)]
+pub struct DrivingCarId(pub Option<Uuid>);
+
+/// Fired the frame a reset message is sent, so the camera can snap to
+/// wherever the car ends up instead of smoothly chasing what — until the
+/// server's reply actually arrives and replicates back — still looks like
+/// the car sitting exactly where it was.
 #[derive(Message)]
 pub struct CarResetEvent;
 
-fn read_car_input(keyboard: Res<ButtonInput<KeyCode>>, mut input: ResMut<CarInput>) {
+/// Skips entirely unless actively driving (`pilot::ControlMode::Car`) —
+/// `pilot.rs`'s `handle_vehicle_key` already sent a final zeroed/braked
+/// `CarInputMsg` the moment you stepped out (`F`), and leaving this system
+/// running would immediately overwrite the *local* `CarInput` resource with
+/// whatever WASD state exists (now meant for the plane or your own on-foot
+/// walk instead) — harmless on its own since nothing reads `CarInput`
+/// locally to move anything anymore, but `send_car_input` would then start
+/// re-sending that stale WASD state to the server every tick, right back
+/// into the exact bug `handle_vehicle_key`'s final message was sent to
+/// prevent.
+fn read_car_input(
+    mode: Res<crate::pilot::ControlMode>,
+    chat_open: Res<crate::chat::ChatOpen>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut input: ResMut<CarInput>,
+) {
+    if *mode != crate::pilot::ControlMode::Car {
+        return;
+    }
+    // Brake to a stop instead of just no longer reading WASD — leaving
+    // whatever throttle/steer was last held would keep being re-sent every
+    // tick (see `send_car_input`'s own docs on why nothing else ever times
+    // that out), reading as the car speeding off on its own the moment you
+    // start typing a chat message mid-drive.
+    if chat_open.0 {
+        *input = CarInput { throttle: 0.0, steer: 0.0, brake: true, boost: false };
+        return;
+    }
     let mut throttle = 0.0;
     let mut steer = 0.0;
     if keyboard.pressed(KeyCode::KeyW) || keyboard.pressed(KeyCode::ArrowUp) {
@@ -70,291 +96,114 @@ fn read_car_input(keyboard: Res<ButtonInput<KeyCode>>, mut input: ResMut<CarInpu
     input.boost = keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
 }
 
-/// Spawns the physics body for the local player's own car — cosmetics
-/// (chassis mesh, wheels, cabin) are handled generically for every car,
-/// local or remote, by car_render.rs's `On<Insert, CarChassis>` observer,
-/// which fires for this same spawn once `CarChassis` lands below.
-///
-/// Tagged `LocalCar` (requires `Signature::of::<LocalCar>()`, see
-/// protocol.rs) so that once the server's authoritative version of this
-/// same car replicates in, bevy_replicon merges it into this entity
-/// instead of spawning a visible duplicate — this spawn *is* the
-/// client-side prediction.
-///
-/// Reacts to `LoginAttempted` (fired the instant a Register/Login
-/// request is *sent*, see `auth_ui.rs`), not `AuthResultMsg` (the
-/// response): tried reacting to the response first, on the theory that
-/// the server sends it before spawning the authoritative car so this
-/// side would still have a head start — but replication and custom
-/// events travel over separate renet channels with no ordering guarantee
-/// between them, so the car's own replicated data could (and, tested
-/// live, reliably did) arrive before this side ever got the message,
-/// losing the signature match entirely. The player ended up with two
-/// disconnected cars — their own undriven predicted one, plus a separate
-/// "remote-looking" copy of the real one — and since every distance
-/// check (e.g. building placement) validates against that real, unmerged
-/// car rather than the one the camera was actually following, placing
-/// anything failed with "too far away" while standing right next to the
-/// target. Reacting to the *request* instead means racing a full network
-/// round trip, not another message on a different channel — a much
-/// safer margin. The account's real `player_id` isn't known yet at this
-/// point (a fresh registration doesn't even have one server-side yet),
-/// so `color_seed` falls back to the old connection-id-based guess here;
-/// once the real `CarChassis` merges in it corrects to the account-based
-/// color same as ever. `spawned` is a one-shot latch — a failed attempt's
-/// retry reuses the same already-spawned car rather than spawning again.
-fn spawn_car_after_login(
-    mut attempted_events: MessageReader<LoginAttempted>,
+/// Sends the current `CarInput` to the server every `FixedUpdate` tick
+/// while actively driving — the only place car input actually goes
+/// anywhere now that there's no local physics/prediction to also feed (see
+/// this module's top-level docs). Mirrors `aircraft.rs`'s
+/// `send_plane_input` exactly, including gating on mode: while flying or on
+/// foot there's nothing meaningful to send, and continuing to send the
+/// last-set brake state every tick would just be wasted traffic (the
+/// server already keeps re-applying whatever it last received, forever,
+/// same as it does for a plane).
+fn send_car_input(
+    mode: Res<crate::pilot::ControlMode>,
+    input: Res<CarInput>,
+    driving: Res<DrivingCarId>,
     mut commands: Commands,
-    noise: Res<TerrainNoise>,
-    client_id: Res<crate::net::LocalClientId>,
-    mut spawned: Local<bool>,
 ) {
-    if *spawned || attempted_events.read().next().is_none() {
+    if *mode != crate::pilot::ControlMode::Car {
         return;
     }
-    *spawned = true;
-
-    // WorldOrigin always starts at true (0, 0, 0), so local and true
-    // coordinates coincide for this very first spawn. Terrain can be
-    // genuinely extreme now, so search nearby for flat-ish ground rather
-    // than trusting true (0, 0) itself not to be a cliff face.
-    let spawn_true = find_flat_spawn(&noise, DVec3::ZERO, SPAWN_SEARCH_RADIUS);
-    let ground_y = height_at(&noise, spawn_true.x, spawn_true.z);
-    let spawn_x = spawn_true.x as f32;
-    let spawn_z = spawn_true.z as f32;
-
-    let mut chassis = shared::car_physics::default_chassis();
-    // The account's real player_id isn't known yet at this point (see
-    // this function's own docs) — this connection-id-based guess is
-    // wrong for a returning player (a different color every relaunch,
-    // the exact problem account-based coloring was meant to fix) and
-    // gets corrected the moment the real, account-colored CarChassis
-    // replicates in and merges with this entity, same one-tick-visible
-    // tradeoff every other predicted-spawn guess in this file accepts.
-    chassis.color_seed = client_id.0 as u32;
-    let half_extents = chassis.half_extents;
-
-    commands.spawn((
-        Transform::from_xyz(spawn_x, ground_y + 2.0, spawn_z),
-        RigidBody::Dynamic,
-        Collider::cuboid(half_extents.x, half_extents.y, half_extents.z),
-        AdditionalMassProperties::Mass(shared::car_physics::CAR_MASS),
-        Velocity::zero(),
-        ExternalForce::default(),
-        Damping {
-            linear_damping: shared::car_physics::CAR_LINEAR_DAMPING,
-            angular_damping: shared::car_physics::CAR_ANGULAR_DAMPING,
-        },
-        Ccd::enabled(),
-        chassis,
-        // Matches the server's own spawn value (see CarChassis::color_seed's
-        // docs for why the same "predict a matching guess so there's no
-        // visible pop once the authoritative echo merges in" reasoning
-        // applies here too) — every car starts at full health, so this
-        // guess is always right at connect time.
-        Health::full(DEFAULT_MAX_HEALTH),
-        // Guess for a brand-new player; a returning player's real balance
-        // (loaded from Postgres) replaces this within moments of the
-        // server's Wallet component replicating in — same one-tick-visible
-        // "usually right, corrected fast if not" tradeoff CarChassis's
-        // color_seed guess already accepts.
-        Wallet { energy: STARTING_ENERGY, ore: STARTING_ORE },
-        CarCosmetics::default(),
-        TerrainTracker,
-        LocalCar(client_id.0),
-    ));
+    let Some(car_id) = driving.0 else { return };
+    commands.client_trigger(CarInputMsg {
+        car_id,
+        throttle: input.throttle,
+        steer: input.steer,
+        brake: input.brake,
+        boost: input.boost,
+    });
 }
 
-/// R: right the car exactly where it already is — corrects orientation and
-/// drops it back onto the ground at its *own current* x/z, no search, no
-/// teleport. Used to search for flat ground somewhere nearby instead (the
-/// old "unstick me" behavior); changed because a flip on a hillside
-/// shouldn't relocate you to wherever the nearest flat patch happened to
-/// be — you just want to be back on your wheels where you already were.
+/// Tags a newly-replicated car as `LocalCar` once its ownership can be
+/// checked — every car the player owns, not just one (full parity with
+/// `aircraft.rs`'s `tag_local_plane`, which already does the same for
+/// planes: a player can own several, exactly like several planes, now that
+/// a car carries no local-prediction singleton assumption to break). A
+/// retried `Update` system, not a one-shot `On<Insert, CarChassis>`
+/// observer: replication and the `AuthResultMsg` this client's own
+/// `LocalPlayerId` comes from travel over separate renet channels with no
+/// ordering guarantee, so an insert-time-only check can silently lose that
+/// race and never tag the car at all (see `player_account.rs`'s
+/// `tag_local_player_account`, which hit exactly this live).
+/// `Without<LocalCar>` keeps the retry cheap (a tagged car, or someone
+/// else's, is skipped every frame).
+fn tag_local_car(
+    mut commands: Commands,
+    local_player_id: Res<crate::auth_ui::LocalPlayerId>,
+    cars: Query<(Entity, &CarChassis), Without<LocalCar>>,
+) {
+    let Some(player_id) = local_player_id.0 else {
+        return;
+    };
+    for (entity, chassis) in &cars {
+        if chassis.owner_player_id == player_id {
+            commands.entity(entity).insert(LocalCar);
+        }
+    }
+}
+
+/// R: ask the server to right *a* car exactly where it already is — no
+/// local guess, no local Transform/Velocity write at all now (see this
+/// module's top-level docs on why a car is server-authoritative only).
+/// Picks whichever owned car happens to be first in iteration order when
+/// you own more than one — the same "arbitrary but consistent, not an
+/// error" tolerance `aircraft.rs`'s multi-plane systems already accept,
+/// rather than a `.single()` that would silently do nothing at all for
+/// anyone who's ever built a second Hangar.
 fn flip_car_upright(
     keyboard: Res<ButtonInput<KeyCode>>,
-    noise: Res<TerrainNoise>,
+    chat_open: Res<crate::chat::ChatOpen>,
     origin: Res<WorldOrigin>,
-    mut chassis_q: Query<(&mut Transform, &mut Velocity, &mut ExternalForce), With<LocalCar>>,
+    chassis_q: Query<&Transform, With<LocalCar>>,
     mut reset_events: MessageWriter<CarResetEvent>,
     mut commands: Commands,
-    mut local_reset: ResMut<crate::prediction::LocalResetGeneration>,
 ) {
-    if !keyboard.just_pressed(KeyCode::KeyR) {
+    if chat_open.0 || !keyboard.just_pressed(KeyCode::KeyR) {
         return;
     }
-    let Ok((mut transform, mut velocity, mut ext_force)) = chassis_q.single_mut() else {
+    let Some(transform) = chassis_q.iter().next() else {
         return;
     };
 
     let true_pos = origin.to_true(transform.translation);
-    let ground_y = height_at(&noise, true_pos.x, true_pos.z);
-    transform.translation.y = ground_y + 2.0;
-    transform.rotation = Quat::IDENTITY;
-    *velocity = Velocity::zero();
-    *ext_force = ExternalForce::default();
     reset_events.write(CarResetEvent);
-
-    // Tell the server to right this car too — same reasoning CarResetMsg's
-    // docs give: without this, the server's still-in-flight pre-flip
-    // snapshot would look like a real desync and reconciliation would yank
-    // the car back toward its old (flipped) orientation/position.
     commands.client_trigger(shared::protocol::FlipUprightMsg {
         true_x: true_pos.x,
         true_z: true_pos.z,
     });
-    local_reset.0 = local_reset.0.wrapping_add(1);
 }
 
-/// Handles a `RegenerateWorldEvent` (N, see terrain.rs): the old position
-/// is meaningless after a regen (new terrain, WorldOrigin reset to zero),
-/// so unlike R this still searches for a genuinely new flat spawn.
+/// Handles a `RegenerateWorldEvent` (N, see terrain.rs): asks the server to
+/// find fresh flat ground and reposition *a* car there — same "server does
+/// the actual work, client just asks and waits for the replicated result"
+/// shape `flip_car_upright` uses, and the same "first owned car, not an
+/// error if there's more than one" tolerance.
 fn reset_car_after_regen(
-    noise: Res<TerrainNoise>,
     origin: Res<WorldOrigin>,
     mut regenerated: MessageReader<RegenerateWorldEvent>,
-    mut chassis_q: Query<(&mut Transform, &mut Velocity, &mut ExternalForce), With<LocalCar>>,
+    chassis_q: Query<(), With<LocalCar>>,
     mut reset_events: MessageWriter<CarResetEvent>,
     mut commands: Commands,
-    mut local_reset: ResMut<crate::prediction::LocalResetGeneration>,
 ) {
     if regenerated.read().next().is_none() {
         return;
     }
-    let Ok((mut transform, mut velocity, mut ext_force)) = chassis_q.single_mut() else {
+    if chassis_q.iter().next().is_none() {
         return;
-    };
-    let spawn_true = find_flat_spawn(&noise, origin.offset, SPAWN_SEARCH_RADIUS);
-    let ground_y = height_at(&noise, spawn_true.x, spawn_true.z);
-    let local_spawn = (spawn_true - origin.offset).as_vec3();
-    transform.translation = Vec3::new(local_spawn.x, ground_y + 2.0, local_spawn.z);
-    transform.rotation = Quat::IDENTITY;
-    *velocity = Velocity::zero();
-    *ext_force = ExternalForce::default();
+    }
     reset_events.write(CarResetEvent);
-
     commands.client_trigger(shared::protocol::CarResetMsg {
         near_true_x: origin.offset.x,
         near_true_z: origin.offset.z,
     });
-    local_reset.0 = local_reset.0.wrapping_add(1);
-}
-
-fn car_suspension_and_drive(
-    time: Res<Time>,
-    input: Res<CarInput>,
-    rapier_context: ReadRapierContext,
-    mut chassis_q: Query<
-        (
-            Entity,
-            &GlobalTransform,
-            &Velocity,
-            &mut ExternalForce,
-            &CarChassis,
-        ),
-        With<LocalCar>,
-    >,
-    mut wheels_q: Query<(&ChildOf, &mut Transform, &mut Wheel)>,
-) {
-    let Ok(context) = rapier_context.single() else {
-        return;
-    };
-    let dt = time.delta_secs();
-    if dt <= 0.0 {
-        return;
-    }
-
-    for (chassis_entity, chassis_gt, velocity, mut ext_force, chassis) in &mut chassis_q {
-        let chassis_transform = chassis_gt.compute_transform();
-        let center_of_mass = chassis_transform.translation;
-        let up = chassis_transform.up();
-        let forward = chassis_transform.forward();
-        let right = chassis_transform.right();
-
-        let mut total_force = Vec3::ZERO;
-        let mut total_torque = Vec3::ZERO;
-        let mut wheels_grounded = 0;
-
-        for (child_of, mut wheel_tf, mut wheel) in &mut wheels_q {
-            if child_of.parent() != chassis_entity {
-                continue;
-            }
-
-            let ray_origin = chassis_transform.transform_point(wheel.local_offset);
-            let ray_dir = -up;
-            let max_toi = chassis.rest_length + chassis.wheel_radius;
-
-            let hit = context.cast_ray_and_get_normal(
-                ray_origin,
-                *ray_dir,
-                max_toi,
-                true,
-                QueryFilter::new().exclude_rigid_body(chassis_entity),
-            );
-
-            let steer_angle = if wheel.is_front {
-                input.steer * chassis.max_steer_rad
-            } else {
-                0.0
-            };
-            let wheel_forward = Quat::from_axis_angle(*up, steer_angle) * *forward;
-            let wheel_right = Quat::from_axis_angle(*up, steer_angle) * *right;
-
-            let mut suspension_len = max_toi;
-
-            if let Some((_entity, intersection)) = hit {
-                wheels_grounded += 1;
-                suspension_len = (intersection.time_of_impact - chassis.wheel_radius)
-                    .max(0.0)
-                    .min(chassis.rest_length);
-                let compression = chassis.rest_length - suspension_len;
-
-                let point_velocity =
-                    velocity.linear_velocity_at_point(intersection.point, center_of_mass);
-                let closing_speed = point_velocity.dot(*up);
-                let arm = intersection.point - center_of_mass;
-
-                // Suspension/drive/traction/brake math lives in
-                // shared::car_physics as a pure function so client and
-                // server can never quietly diverge on how a wheel behaves,
-                // and so it's unit-testable in isolation (see that module's
-                // tests, particularly the friction-circle clamp regression
-                // test for the old oscillating-roll flip bug).
-                let out = compute_wheel_forces(
-                    chassis,
-                    &WheelStepInput {
-                        compression,
-                        closing_speed,
-                        point_velocity,
-                        up: *up,
-                        wheel_forward,
-                        wheel_right,
-                        arm,
-                        throttle: input.throttle,
-                        brake: input.brake,
-                        boost: input.boost,
-                    },
-                );
-                total_force += out.force;
-                total_torque += out.torque;
-                wheel.spin += out.forward_speed / chassis.wheel_radius.max(0.01) * dt;
-            }
-
-            wheel_tf.translation = Vec3::new(
-                wheel.local_offset.x,
-                -chassis.half_extents.y - suspension_len,
-                wheel.local_offset.z,
-            );
-            wheel_tf.rotation = Quat::from_rotation_y(steer_angle)
-                * Quat::from_rotation_z(std::f32::consts::FRAC_PI_2)
-                * Quat::from_rotation_y(wheel.spin);
-        }
-
-        // No gravity hack: rely on Rapier's own gravity for the fall, we only
-        // add suspension/drive/traction on top of it.
-        let _ = wheels_grounded;
-        ext_force.force = total_force;
-        ext_force.torque = total_torque;
-    }
 }

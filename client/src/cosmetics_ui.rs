@@ -19,11 +19,18 @@ impl Plugin for CosmeticsUiPlugin {
     }
 }
 
+/// `pub` (field included) so `settings.rs`'s own "Open Garage" button can
+/// set this directly rather than needing its own message/event just to
+/// hand off to an already-existing panel.
 #[derive(Resource, Default)]
-struct CosmeticsPanelOpen(bool);
+pub struct CosmeticsPanelOpen(pub bool);
 
-fn toggle_panel(keyboard: Res<ButtonInput<KeyCode>>, mut open: ResMut<CosmeticsPanelOpen>) {
-    if keyboard.just_pressed(KeyCode::KeyV) {
+fn toggle_panel(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    chat_open: Res<crate::chat::ChatOpen>,
+    mut open: ResMut<CosmeticsPanelOpen>,
+) {
+    if !chat_open.0 && keyboard.just_pressed(KeyCode::KeyV) {
         open.0 = !open.0;
     }
 }
@@ -58,7 +65,11 @@ fn draw_cosmetics_panel(
     if !open.0 {
         return Ok(());
     }
-    let Ok(mut cosmetics) = car_q.single_mut() else {
+    // `.iter_mut().next()`, not `.single_mut()` — a player can own several
+    // cars now (see `car.rs`'s top-level docs), so this just edits
+    // whichever one happens to be first rather than the panel silently
+    // refusing to open at all for anyone who owns more than one.
+    let Some(mut cosmetics) = car_q.iter_mut().next() else {
         return Ok(());
     };
 
@@ -105,7 +116,10 @@ fn draw_cosmetics_panel(
                             (color[1] * 255.0) as u8,
                             (color[2] * 255.0) as u8,
                         );
-                        let button = egui::Button::new("").fill(swatch).min_size(egui::vec2(36.0, 36.0));
+                        let button = egui::Button::new("")
+                            .fill(swatch)
+                            .min_size(egui::vec2(36.0, 36.0))
+                            .sense(egui::Sense::CLICK);
                         let button = if is_selected {
                             button.stroke(egui::Stroke::new(3.0, egui::Color32::WHITE))
                         } else {

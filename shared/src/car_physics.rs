@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Tire friction coefficient (max lateral grip = TIRE_GRIP * normal load).
 pub const TIRE_GRIP: f32 = 1.6;
@@ -35,6 +36,23 @@ pub struct CarChassis {
     /// `CarChassis` itself is replicated, *and* it stays the same color
     /// across relaunches (account-based, not per-connection).
     pub color_seed: u32,
+    /// The durable account id of whoever this car belongs to — lets a
+    /// client match a replicated car back to its owner (e.g.
+    /// `building_render.rs`'s "tint this building's logo with the owner's
+    /// actual car paint" lookup) without needing `PlayerInfo` co-located on
+    /// the same entity, since account state (`PlayerInfo`, `Wallet`,
+    /// `VillagerQueue`) now lives on its own always-present player entity,
+    /// independent of whether that player currently owns a car at all (see
+    /// `server::car_sim`'s docs).
+    pub owner_player_id: Uuid,
+    /// Unique per car, unlike `owner_player_id` which every car a player
+    /// owns shares — the actual key `CarInputMsg`/`RecallToHangarMsg`
+    /// target, so driving or recalling one specific owned car doesn't
+    /// affect every other one a multi-car owner has parked elsewhere (see
+    /// `client::pilot`'s `DrivingCarId` and `server::car_sim`'s
+    /// `apply_car_input`/`apply_recall_to_hangar`). Generated once at
+    /// spawn (`spawn_car_for`) and never changed.
+    pub car_id: Uuid,
 }
 
 #[derive(Component)]
@@ -63,13 +81,9 @@ pub struct CarInput {
 
 /// Server-side per-car input state — see `CarInput`'s docs for why this
 /// can't just be `CarInput` itself with an extra `Component` derive.
-/// `last_applied_sequence` is the reconciliation anchor echoed back to
-/// clients in `CarSnapshot` (protocol.rs): the sequence number of the
-/// `CarInputMsg` this state was last updated from.
 #[derive(Component, Clone, Copy, Default, Debug)]
 pub struct CarInputState {
     pub input: CarInput,
-    pub last_applied_sequence: u32,
 }
 
 /// Rapier body-level tuning (mass, damping) that lives outside `CarChassis`
@@ -128,6 +142,17 @@ pub fn default_chassis() -> CarChassis {
         // placeholder only matters if something spawns a car without ever
         // overwriting it.
         color_seed: 0,
+        // Same "caller overwrites this with the real value" contract as
+        // `color_seed` — the client's own local predicted spawn doesn't
+        // know its account id yet either (see `client::car::spawn_car_after_login`'s
+        // docs), so this placeholder is what it guesses with until the
+        // server's authoritative echo merges in and corrects both fields
+        // at once.
+        owner_player_id: Uuid::nil(),
+        // Same "caller overwrites this" placeholder contract as
+        // `owner_player_id` — `spawn_car_for` always sets the real,
+        // unique id right after calling this.
+        car_id: Uuid::nil(),
     }
 }
 
@@ -260,7 +285,24 @@ pub fn compute_wheel_forces(chassis: &CarChassis, input: &WheelStepInput) -> Whe
     torque += input.arm.cross(traction_force);
 
     if input.brake {
-        let brake_force = -input.wheel_forward * (forward_speed * chassis.brake_force * 0.01);
+        // Clamped to the same Coulomb friction circle as lateral traction
+        // just above (a tire can't generate more stopping force than it has
+        // grip, longitudinal or lateral) — this term used to be unbounded,
+        // which was invisible under ordinary gradual braking (`brake_force`
+        // only ever grows as fast as the player's own forward speed does)
+        // but exploded the instant `brake` flips from `false` to `true` in
+        // a single tick at real speed: a car exit sends one hard brake
+        // input immediately (see pilot.rs's `handle_vehicle_key`), and an
+        // unclamped multi-kN force at the contact point's torque arm
+        // pitched the chassis into a dive, over-compressing the front
+        // suspension (also unclamped) and launching it back up the very
+        // next tick — the "car floats into the air on exit" bug.
+        let desired_brake_force = -input.wheel_forward * (forward_speed * chassis.brake_force * 0.01);
+        let brake_force = if desired_brake_force.length() > max_friction {
+            desired_brake_force.normalize() * max_friction
+        } else {
+            desired_brake_force
+        };
         force += brake_force;
         torque += input.arm.cross(brake_force);
     }
@@ -288,6 +330,8 @@ mod tests {
             brake_force: 20_000.0,
             traction: 12_000.0,
             color_seed: 0,
+            owner_player_id: Uuid::nil(),
+            car_id: Uuid::nil(),
         }
     }
 
@@ -359,6 +403,53 @@ mod tests {
         );
         // Sliding in +right should produce a corrective force in -right.
         assert!(lateral_component.dot(wheel_right) < 0.0);
+    }
+
+    /// Braking must never demand more force than the tire's own friction
+    /// circle allows, no matter how fast the car is going when `brake`
+    /// flips on — an earlier version let this term grow unbounded with
+    /// speed, which was invisible under gradual braking but produced a
+    /// multi-g pitch spike (launching the car) the instant a hard brake was
+    /// applied in a single tick at real speed (see `compute_wheel_forces`'s
+    /// comment on the car-floats-into-the-air-on-exit bug this fixed).
+    #[test]
+    fn brake_force_is_clamped_to_friction_circle() {
+        let chassis = test_chassis();
+        let compression = 0.05_f32;
+        let up = Vec3::Y;
+        let wheel_forward = Vec3::NEG_Z;
+        let wheel_right = Vec3::X;
+        let input = WheelStepInput {
+            compression,
+            closing_speed: 0.0,
+            point_velocity: wheel_forward * 60.0, // absurdly high forward speed
+            up,
+            wheel_forward,
+            wheel_right,
+            arm: Vec3::ZERO,
+            throttle: 0.0,
+            brake: true,
+            boost: false,
+        };
+        let out = compute_wheel_forces(&chassis, &input);
+
+        let suspension_force = chassis.spring_stiffness * compression;
+        let max_friction = suspension_force * TIRE_GRIP;
+
+        let vertical = out.force.dot(up);
+        assert!(
+            (vertical - suspension_force).abs() < 1e-2,
+            "vertical component should equal suspension force alone: {vertical} vs {suspension_force}"
+        );
+
+        let longitudinal_component = out.force - up * vertical;
+        assert!(
+            (longitudinal_component.length() - max_friction).abs() < 1e-2,
+            "brake force should sit exactly at the friction circle limit: {} vs {max_friction}",
+            longitudinal_component.length()
+        );
+        // Braking while moving forward should decelerate, not accelerate.
+        assert!(longitudinal_component.dot(wheel_forward) < 0.0);
     }
 
     fn throttling_input(throttle: f32, boost: bool) -> WheelStepInput {

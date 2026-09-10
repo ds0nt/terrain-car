@@ -36,6 +36,13 @@ pub struct WalletRow {
 }
 
 #[derive(Debug, Clone, FromRow)]
+pub struct PositionRow {
+    pub player_id: Uuid,
+    pub true_x: f64,
+    pub true_z: f64,
+}
+
+#[derive(Debug, Clone, FromRow)]
 pub struct BuildingRow {
     pub id: Uuid,
     pub owner_player_id: Uuid,
@@ -54,7 +61,9 @@ pub struct BuildingRow {
 /// are the one exception that isn't fire-and-forget — see `AuthResult`.
 pub enum PersistenceCommand {
     SaveWallet(WalletRow),
+    SavePosition(PositionRow),
     SaveBuilding(BuildingRow),
+    DeleteBuilding(Uuid),
     /// `client_entity` rides along purely so the reply (`AuthResult`) can
     /// be routed back to the right connection — the persistence thread has
     /// no other notion of "which client asked this."
@@ -65,7 +74,7 @@ pub enum PersistenceCommand {
 /// Sent back from the persistence thread once loaded — currently only
 /// happens once, right after connecting/migrating at startup.
 pub enum PersistenceEvent {
-    Loaded { wallets: Vec<WalletRow>, buildings: Vec<BuildingRow> },
+    Loaded { wallets: Vec<WalletRow>, buildings: Vec<BuildingRow>, positions: Vec<PositionRow> },
     Unavailable,
     AuthResult { client_entity: Entity, outcome: AuthOutcome },
 }
@@ -207,9 +216,19 @@ fn run_persistence_thread(
                             warn!("persistence: failed to save wallet for {}: {e}", wallet.player_id);
                         }
                     }
+                    PersistenceCommand::SavePosition(position) => {
+                        if let Err(e) = save_position(&pool, &position).await {
+                            warn!("persistence: failed to save position for {}: {e}", position.player_id);
+                        }
+                    }
                     PersistenceCommand::SaveBuilding(building) => {
                         if let Err(e) = save_building(&pool, &building).await {
                             warn!("persistence: failed to save building {}: {e}", building.id);
+                        }
+                    }
+                    PersistenceCommand::DeleteBuilding(id) => {
+                        if let Err(e) = delete_building(&pool, id).await {
+                            warn!("persistence: failed to delete building {id}: {e}");
                         }
                     }
                     PersistenceCommand::Register { client_entity, username, password } => {
@@ -309,6 +328,19 @@ async fn save_wallet(pool: &PgPool, wallet: &WalletRow) -> sqlx::Result<()> {
     Ok(())
 }
 
+async fn save_position(pool: &PgPool, position: &PositionRow) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into player_positions (player_id, true_x, true_z) values ($1, $2, $3) \
+         on conflict (player_id) do update set true_x = excluded.true_x, true_z = excluded.true_z",
+    )
+    .bind(position.player_id)
+    .bind(position.true_x)
+    .bind(position.true_z)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 async fn save_building(pool: &PgPool, building: &BuildingRow) -> sqlx::Result<()> {
     sqlx::query(
         "insert into buildings (id, owner_player_id, kind, true_x, true_z, build_complete_at, rotation_y, ground_y) \
@@ -328,6 +360,11 @@ async fn save_building(pool: &PgPool, building: &BuildingRow) -> sqlx::Result<()
     Ok(())
 }
 
+async fn delete_building(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("delete from buildings where id = $1").bind(id).execute(pool).await?;
+    Ok(())
+}
+
 async fn load_all(pool: &PgPool) -> sqlx::Result<PersistenceEvent> {
     let wallets = sqlx::query_as::<_, WalletRow>("select player_id, energy, ore from wallets")
         .fetch_all(pool)
@@ -337,5 +374,9 @@ async fn load_all(pool: &PgPool) -> sqlx::Result<PersistenceEvent> {
     )
     .fetch_all(pool)
     .await?;
-    Ok(PersistenceEvent::Loaded { wallets, buildings })
+    let positions =
+        sqlx::query_as::<_, PositionRow>("select player_id, true_x, true_z from player_positions")
+            .fetch_all(pool)
+            .await?;
+    Ok(PersistenceEvent::Loaded { wallets, buildings, positions })
 }

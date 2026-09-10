@@ -2,9 +2,10 @@ use bevy::math::DVec3;
 use bevy::prelude::*;
 use noise::{NoiseFn, Perlin};
 
-// Chunked, streamed terrain: chunks spawn/despawn around whatever entity
-// carries `TerrainTracker` (the car) on the client, and around whatever the
-// server is simulating on the server. Height is a pure function of *true*
+// Chunked, streamed terrain: chunks spawn/despawn around wherever the
+// player currently is (car, plane, or on foot — see client's
+// `pilot::PlayerFocus`) on the client, and around whatever the server is
+// simulating on the server. Height is a pure function of *true*
 // (world-origin-relative) (x, z) at f64 precision — chunk edges always
 // agree exactly because neighboring chunks sample the same function at the
 // same true coordinates, no stitching needed, and content doesn't change
@@ -330,17 +331,19 @@ fn biome_lerp_f32(corners: [f32; 4], temperature: f32, moisture: f32) -> f32 {
 /// corner reading as grass or blue-tinted snow.
 pub fn terrain_color(height: f32, slope: f32, detail: f32, temperature: f32, moisture: f32) -> Color {
     // [cold_dry, cold_wet, hot_dry, hot_wet]
+    // Pulled ~50% toward each color's own grey (average-channel) value —
+    // increased from 40% for a more muted, greyish planetary look.
     let lowland_corners = [
-        Vec3::new(0.58, 0.40, 0.30), // pale dusty rust
-        Vec3::new(0.30, 0.20, 0.16), // dark basaltic red-brown
-        Vec3::new(0.72, 0.40, 0.20), // bright ochre/orange regolith
-        Vec3::new(0.50, 0.26, 0.16), // deep rust-brown
+        Vec3::new(0.46, 0.42, 0.41), // pale grey-rust
+        Vec3::new(0.32, 0.28, 0.26), // dark grey-brown
+        Vec3::new(0.52, 0.45, 0.40), // muted grey-ochre
+        Vec3::new(0.44, 0.37, 0.33), // grey-rust-brown
     ];
     let rock_corners = [
-        Vec3::new(0.40, 0.33, 0.29), // grey-brown basalt
-        Vec3::new(0.26, 0.23, 0.23), // dark basalt grey
-        Vec3::new(0.58, 0.30, 0.17), // rusty sandstone/canyon rock
-        Vec3::new(0.40, 0.28, 0.22), // mid rust-brown rock
+        Vec3::new(0.41, 0.38, 0.36), // grey-brown basalt
+        Vec3::new(0.30, 0.29, 0.28), // dark grey basalt
+        Vec3::new(0.48, 0.41, 0.36), // grey sandstone
+        Vec3::new(0.40, 0.35, 0.31), // mid grey-brown rock
     ];
     // Snow line height, as a fraction of MOUNTAIN_HEIGHT. The desert corner
     // is set far above any possible peak so it effectively never caps —

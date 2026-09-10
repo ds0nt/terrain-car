@@ -14,11 +14,13 @@ use shared::terrain_gen::{
     TerrainNoise, CHUNK_RESOLUTION, CHUNK_SIZE,
 };
 
+use crate::pilot::PlayerFocus;
 use crate::terrain_material::TerrainMaterial;
 use crate::worldspace::WorldOrigin;
 
-// Chunked, streamed terrain: chunks spawn/despawn around whatever entity
-// carries `TerrainTracker` (the car). The height/color/climate math itself
+// Chunked, streamed terrain: chunks spawn/despawn around `PlayerFocus`
+// (wherever the player currently is — car, plane, or on foot), not a
+// single hardcoded entity. The height/color/climate math itself
 // lives in `shared::terrain_gen` as pure functions of true (world-origin-
 // relative) (x, z) — that's what lets chunk edges agree exactly with no
 // stitching, content survive a `WorldOrigin` rebase unchanged, and (once
@@ -27,9 +29,39 @@ use crate::worldspace::WorldOrigin;
 // over the network. This module is just the client-side streaming +
 // visual-mesh half of that; the noise/height functions themselves are in
 // `shared`.
-const LOAD_RADIUS_CHUNKS: i64 = 4;
-const UNLOAD_RADIUS_CHUNKS: i64 = 5;
 const CHUNKS_SPAWNED_PER_FRAME: usize = 3;
+
+/// How many chunks out `stream_chunks` keeps loaded around the player —
+/// live-adjustable (see `settings.rs`'s view-distance slider), unlike the
+/// fixed radius this used to be. Obstacles (rocks/trees) are spawned as
+/// children of their own chunk (see `spawn_chunk`), so this one setting
+/// already controls *their* streamed-in range too — there's no separate
+/// "object view distance" to wire up. Changing this needs no special
+/// handling anywhere: `stream_chunks` and its "stale" cleanup both already
+/// re-read this fresh every frame, so raising it just naturally queues
+/// more chunks over the next few frames and lowering it naturally unloads
+/// whatever's now outside the new radius, the exact same as when the
+/// player's *position* changes.
+#[derive(Resource)]
+pub struct ViewDistance {
+    pub chunks: i64,
+}
+
+impl Default for ViewDistance {
+    fn default() -> Self {
+        Self { chunks: 4 }
+    }
+}
+
+impl ViewDistance {
+    /// A little wider than `chunks` so a chunk right at the edge of load
+    /// range doesn't thrash in and out every frame — same margin the old
+    /// fixed `UNLOAD_RADIUS_CHUNKS` constant used relative to
+    /// `LOAD_RADIUS_CHUNKS`.
+    fn unload_radius(&self) -> i64 {
+        self.chunks + 1
+    }
+}
 
 pub struct TerrainPlugin;
 
@@ -37,6 +69,7 @@ impl Plugin for TerrainPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<TerrainNoise>()
             .init_resource::<LoadedChunks>()
+            .init_resource::<ViewDistance>()
             .add_message::<RegenerateWorldEvent>()
             .add_observer(apply_world_regen)
             .add_systems(Startup, spawn_initial_chunks)
@@ -44,18 +77,19 @@ impl Plugin for TerrainPlugin {
     }
 }
 
-/// Marks the entity terrain streaming follows (the car chassis).
-#[derive(Component)]
-pub struct TerrainTracker;
-
 // Marker only — which coord an entity is lives in `LoadedChunks.chunks`,
 // so despawning by coord never needs to query this back out. `pub` because
 // worldspace.rs needs to shift every loaded chunk's Transform on rebase.
 #[derive(Component)]
 pub struct TerrainChunk;
 
+// pub(crate): pilot.rs's login handler needs to wipe and immediately
+// re-seed this around the real spawn point (see `respawn_chunks_immediate`)
+// — the `Startup` batch below is spawned around true chunk (0,0), which is
+// only correct if the player's actual spawn point also happens to be near
+// true (0,0).
 #[derive(Resource, Default)]
-struct LoadedChunks {
+pub(crate) struct LoadedChunks {
     chunks: HashMap<ChunkCoord, Entity>,
     pending: Vec<ChunkCoord>,
 }
@@ -289,6 +323,34 @@ fn spawn_chunk(
         .id()
 }
 
+/// Spawns a full `LOAD_RADIUS_CHUNKS` grid immediately (not trickled via
+/// `stream_chunks`'s per-frame budget) around `center`. Shared by the
+/// `Startup` pre-login backdrop (`spawn_initial_chunks`, centered on true
+/// chunk (0,0)) and `respawn_chunks_immediate` (centered on wherever the
+/// player actually spawns) — both need "solid ground right now," not a
+/// multi-second trickle-in.
+#[allow(clippy::too_many_arguments)]
+fn spawn_chunk_grid(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    terrain_material: Handle<TerrainMaterial>,
+    noise: &TerrainNoise,
+    origin: &WorldOrigin,
+    loaded: &mut LoadedChunks,
+    view_distance: &ViewDistance,
+    center: ChunkCoord,
+) {
+    for x in -view_distance.chunks..=view_distance.chunks {
+        for z in -view_distance.chunks..=view_distance.chunks {
+            let coord = (center.0 + x, center.1 + z);
+            let entity = spawn_chunk(commands, meshes, materials, terrain_material.clone(), noise, origin, coord);
+            loaded.chunks.insert(coord, entity);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_initial_chunks(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -297,6 +359,7 @@ fn spawn_initial_chunks(
     noise: Res<TerrainNoise>,
     origin: Res<WorldOrigin>,
     mut loaded: ResMut<LoadedChunks>,
+    view_distance: Res<ViewDistance>,
 ) {
     let terrain_material = terrain_materials.add(TerrainMaterial {
         base: StandardMaterial {
@@ -307,21 +370,59 @@ fn spawn_initial_chunks(
         extension: default(),
     });
 
-    for x in -LOAD_RADIUS_CHUNKS..=LOAD_RADIUS_CHUNKS {
-        for z in -LOAD_RADIUS_CHUNKS..=LOAD_RADIUS_CHUNKS {
-            let coord = (x, z);
-            let entity = spawn_chunk(
-                &mut commands,
-                &mut meshes,
-                &mut materials,
-                terrain_material.clone(),
-                &noise,
-                &origin,
-                coord,
-            );
-            loaded.chunks.insert(coord, entity);
-        }
+    spawn_chunk_grid(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        terrain_material,
+        &noise,
+        &origin,
+        &mut loaded,
+        &view_distance,
+        (0, 0),
+    );
+}
+
+/// Wipes every currently-loaded chunk (the `Startup` batch spawned around
+/// true chunk (0,0), stale the instant the player's actual spawn point is
+/// anywhere else) and immediately spawns a fresh grid around `origin`'s new
+/// offset — called once at login, right after `origin.offset` is set to the
+/// server-assigned true spawn position (see `pilot.rs`'s
+/// `spawn_pilot_after_login`).
+///
+/// Immediate, not trickled through `stream_chunks`: the on-foot avatar
+/// spawns this same frame with a real Rapier collider dependency (unlike a
+/// car/plane, which are purely server-authoritative and don't need a local
+/// collider under them) — leaving it to `stream_chunks`'s
+/// `CHUNKS_SPAWNED_PER_FRAME` budget would mean falling through empty air
+/// for the many frames it takes to reach the chunk actually under the
+/// avatar's feet.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn respawn_chunks_immediate(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    terrain_materials: &mut Assets<TerrainMaterial>,
+    noise: &TerrainNoise,
+    origin: &WorldOrigin,
+    loaded: &mut LoadedChunks,
+    view_distance: &ViewDistance,
+) {
+    for (_, entity) in loaded.chunks.drain() {
+        commands.entity(entity).despawn();
     }
+    loaded.pending.clear();
+
+    let terrain_material = terrain_materials.add(TerrainMaterial {
+        base: StandardMaterial {
+            base_color: Color::WHITE,
+            perceptual_roughness: 0.95,
+            ..default()
+        },
+        extension: default(),
+    });
+    let center = world_to_chunk(origin.offset);
+    spawn_chunk_grid(commands, meshes, materials, terrain_material, noise, origin, loaded, view_distance, center);
 }
 
 /// N: request a world regeneration. Regeneration is now server-authoritative
@@ -332,8 +433,12 @@ fn spawn_initial_chunks(
 /// `WorldRegenMsg` comes back — the same single code path a *console*-
 /// triggered regen or another op player's regen also goes through, so this
 /// client's terrain can never desync from what the server actually decided.
-fn regenerate_terrain(keyboard: Res<ButtonInput<KeyCode>>, mut commands: Commands) {
-    if !keyboard.just_pressed(KeyCode::KeyN) {
+fn regenerate_terrain(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    chat_open: Res<crate::chat::ChatOpen>,
+    mut commands: Commands,
+) {
+    if chat_open.0 || !keyboard.just_pressed(KeyCode::KeyN) {
         return;
     }
     commands.client_trigger(RegenRequestMsg);
@@ -361,6 +466,7 @@ fn apply_world_regen(
     info!("client: world regenerated (seed={})", regen.seed);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_chunks(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -369,13 +475,11 @@ fn stream_chunks(
     noise: Res<TerrainNoise>,
     origin: Res<WorldOrigin>,
     mut loaded: ResMut<LoadedChunks>,
-    tracker: Query<&GlobalTransform, With<TerrainTracker>>,
+    focus: Res<PlayerFocus>,
+    view_distance: Res<ViewDistance>,
     existing_material: Query<&MeshMaterial3d<TerrainMaterial>, With<TerrainChunk>>,
 ) {
-    let Ok(tracker_gt) = tracker.single() else {
-        return;
-    };
-    let true_pos = origin.to_true(tracker_gt.translation());
+    let true_pos = origin.to_true(focus.translation);
     let center_chunk = world_to_chunk(true_pos);
 
     let dist2 = |c: ChunkCoord| {
@@ -386,10 +490,11 @@ fn stream_chunks(
 
     // Queue up newly-needed chunks (nearest first) without spawning them
     // all in one frame — a full radius of new chunks appearing at once
-    // (e.g. after a fast respawn) would be a visible hitch.
+    // (e.g. after a fast respawn, or the player just raising view distance
+    // in `settings.rs`) would be a visible hitch.
     let mut wanted = Vec::new();
-    for x in -LOAD_RADIUS_CHUNKS..=LOAD_RADIUS_CHUNKS {
-        for z in -LOAD_RADIUS_CHUNKS..=LOAD_RADIUS_CHUNKS {
+    for x in -view_distance.chunks..=view_distance.chunks {
+        for z in -view_distance.chunks..=view_distance.chunks {
             let coord = (center_chunk.0 + x, center_chunk.1 + z);
             if !loaded.chunks.contains_key(&coord) && !loaded.pending.contains(&coord) {
                 wanted.push(coord);
@@ -436,7 +541,7 @@ fn stream_chunks(
         .filter(|coord| {
             let dx = coord.0 - center_chunk.0;
             let dz = coord.1 - center_chunk.1;
-            dx.abs() > UNLOAD_RADIUS_CHUNKS || dz.abs() > UNLOAD_RADIUS_CHUNKS
+            dx.abs() > view_distance.unload_radius() || dz.abs() > view_distance.unload_radius()
         })
         .copied()
         .collect();

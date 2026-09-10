@@ -24,8 +24,12 @@ impl Plugin for PingsPlugin {
     }
 }
 
-fn send_ping_input(keyboard: Res<ButtonInput<KeyCode>>, mut commands: Commands) {
-    if keyboard.just_pressed(KeyCode::KeyP) {
+fn send_ping_input(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    chat_open: Res<crate::chat::ChatOpen>,
+    mut commands: Commands,
+) {
+    if !chat_open.0 && keyboard.just_pressed(KeyCode::KeyP) {
         commands.client_trigger(PingMsg);
     }
 }

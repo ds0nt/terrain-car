@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 use shared::car_physics::{wheel_mounts, CarChassis, Wheel};
-use shared::protocol::{CarCosmetics, CarSnapshot, LocalCar};
+use shared::protocol::{CarCosmetics, CarSnapshot};
 use shared::worldspace::WorldOrigin;
 
 use crate::owner_color::color_from_seed;
@@ -10,17 +10,21 @@ pub struct CarRenderPlugin;
 impl Plugin for CarRenderPlugin {
     fn build(&self, app: &mut App) {
         app.add_observer(init_car_visuals)
-            .add_systems(Update, (sync_remote_car_transforms, apply_car_cosmetics));
+            .add_systems(Update, (sync_car_transforms, apply_car_cosmetics));
     }
 }
 
-/// Fires for every car — the local player's own (`CarChassis` inserted the
-/// same frame as its physics bundle, see car.rs's spawn_car) and every
-/// remote player's (inserted the moment replication first receives their
-/// `CarChassis`). Spawns the chassis mesh and wheel/cabin cosmetics
-/// generically off just the replicated tuning data, so a remote car needs
-/// zero extra network traffic to look right — this is purely local
-/// rendering setup.
+/// Exponential smoothing rate for `sync_car_transforms` — see that
+/// system's own docs; matches `aircraft.rs`'s identical `SMOOTHING_RATE`
+/// (also 20.0, itself matched to `camera.rs`'s Cockpit-mode rate).
+const SYNC_SMOOTHING_RATE: f32 = 20.0;
+
+/// Fires for every car — yours or anyone else's, no distinction anymore
+/// (see `sync_car_transforms`'s own docs on why): inserted the moment
+/// replication first receives its `CarChassis`. Spawns the chassis mesh
+/// and wheel/cabin cosmetics generically off just the replicated tuning
+/// data, so a car needs zero extra network traffic beyond `CarChassis`
+/// itself to look right — this is purely local rendering setup.
 fn init_car_visuals(
     insert: On<Insert, CarChassis>,
     mut commands: Commands,
@@ -34,10 +38,11 @@ fn init_car_visuals(
     let half_extents = chassis.half_extents;
     let wheel_radius = chassis.wheel_radius;
 
-    // The local car already has its own spawn-computed Transform (same
-    // bundle as CarChassis) — a remote car has none yet (Transform isn't
-    // itself replicated; see protocol.rs's CarSnapshot docs for why), so
-    // `insert_if_new` only actually does anything for remote cars.
+    // No car is ever spawned locally with its own Transform anymore (see
+    // this module's top-level docs) — every one, yours included, arrives
+    // via replication with `Transform` unset, so this placeholder always
+    // applies; `sync_car_transforms` corrects it to the real position the
+    // very next frame.
     commands
         .entity(insert.entity)
         .insert_if_new(Transform::IDENTITY);
@@ -151,25 +156,35 @@ fn init_car_visuals(
     });
 }
 
-/// Remote (non-local) cars have no Rapier body client-side at all — just
-/// mirror the server's replicated snapshot onto Transform every frame. No
-/// smoothing/interpolation in this first pass (a reasonable fast-follow if
-/// remote cars look jittery at low replication rates).
+/// No car has a Rapier body client-side at all anymore, yours included —
+/// every one, purely server-authoritative, just eases its `Transform`
+/// toward the latest replicated snapshot every frame, the same "no
+/// prediction" shape `aircraft.rs`'s `sync_plane_transforms` already uses
+/// for a plane (see `car.rs`'s top-level docs on why this changed, and
+/// that system's own docs on why this is smoothed rather than a direct
+/// snap-to-latest — replication rate and render framerate rarely line up
+/// evenly, and a bare assignment reads as choppy for exactly that reason).
+/// Front-wheel steering angle and spin-while-driving aren't reflected —
+/// `CarInputMsg`'s steer/throttle were never replicated back, only sent —
+/// the same static-wheels look every non-local car already had before
+/// this; own-car parity, not a new regression.
 ///
 /// `CarSnapshot.translation` is server-space, which is always true-space
 /// (the server never rebases its own `WorldOrigin` — a known gap, fine
 /// while everyone stays within a few km of spawn, see server's
 /// terrain_phys.rs). Converting through the client's own `WorldOrigin`
-/// keeps remote cars positioned correctly relative to local terrain even
+/// keeps every car positioned correctly relative to local terrain even
 /// after *this* client has rebased, without needing the server to.
-fn sync_remote_car_transforms(
+fn sync_car_transforms(
+    time: Res<Time>,
     origin: Res<WorldOrigin>,
-    mut cars_q: Query<(&CarSnapshot, &mut Transform), Without<LocalCar>>,
+    mut cars_q: Query<(&CarSnapshot, &mut Transform)>,
 ) {
+    let lerp_factor = 1.0 - (-SYNC_SMOOTHING_RATE * time.delta_secs()).exp();
     for (snapshot, mut transform) in &mut cars_q {
-        let local = (snapshot.translation.as_dvec3() - origin.offset).as_vec3();
-        transform.translation = local;
-        transform.rotation = snapshot.rotation;
+        let target = (snapshot.translation.as_dvec3() - origin.offset).as_vec3();
+        transform.translation = transform.translation.lerp(target, lerp_factor);
+        transform.rotation = transform.rotation.slerp(snapshot.rotation, lerp_factor);
     }
 }
 

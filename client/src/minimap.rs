@@ -1,10 +1,15 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
 use shared::car_physics::CarChassis;
-use shared::protocol::{BuildingSnapshot, CarSnapshot, LocalCar, VillagerSnapshot};
+use shared::protocol::{
+    BuildingSnapshot, CarSnapshot, LocalCar, PlaneSnapshot, PlayerInfo, PlayerOnFootSnapshot, VillagerSnapshot,
+};
 use shared::terrain_gen::{height_at, TerrainNoise};
 
+use crate::aircraft::LocalPlane;
 use crate::owner_color::{color_for_owner, color_from_seed, to_egui_color32};
+use crate::pilot::PlayerFocus;
+use crate::player_account::LocalPlayerAccount;
 use crate::worldspace::WorldOrigin;
 
 /// A 2D radar drawn with `egui`'s painter — replaces the old ASCII
@@ -40,6 +45,39 @@ fn world_to_screen(center: egui::Pos2, dx: f32, dz: f32) -> Option<egui::Pos2> {
     Some(center + offset)
 }
 
+/// Kept clear of the radar's own edge stroke so a clamped blip never
+/// visually sits on top of it.
+const EDGE_MARKER_INSET: f32 = 6.0;
+
+/// Same projection `world_to_screen` uses, but never hides a point that
+/// falls outside the radar's radius — clamps it to the circle's own edge
+/// instead, in whichever direction it actually lies. `true` means it
+/// landed inside the radar unclamped (an ordinary blip); `false` means
+/// it's a direction-only edge marker for something currently off the map.
+fn radar_position(center: egui::Pos2, dx: f32, dz: f32) -> (egui::Pos2, bool) {
+    let scale = RADAR_RADIUS_PX / RADAR_METERS;
+    let offset = egui::vec2(dx * scale, dz * scale);
+    let dist = offset.length();
+    if dist <= RADAR_RADIUS_PX {
+        return (center + offset, true);
+    }
+    let clamped = offset * ((RADAR_RADIUS_PX - EDGE_MARKER_INSET) / dist.max(0.0001));
+    (center + clamped, false)
+}
+
+/// A small triangle pointing straight outward from the radar's own center
+/// — same "arrow, not a blip" convention `player_markers.rs`'s off-screen
+/// compass arrows use in the full 3D view, just for the 2D radar instead.
+fn draw_edge_marker(painter: &egui::Painter, center: egui::Pos2, pos: egui::Pos2, color: egui::Color32) {
+    let dir = (pos - center).normalized();
+    let angle = dir.y.atan2(dir.x);
+    let tip = pos + dir * 5.0;
+    let back_angle = 2.5;
+    let left = pos + egui::vec2((angle + back_angle).cos(), (angle + back_angle).sin()) * 4.0;
+    let right = pos + egui::vec2((angle - back_angle).cos(), (angle - back_angle).sin()) * 4.0;
+    painter.add(egui::Shape::convex_polygon(vec![tip, left, right], color, egui::Stroke::NONE));
+}
+
 /// Muted color bands by *local relief* (height relative to the local
 /// car) — same "terrain near me, not absolute elevation" reasoning the
 /// old ASCII `terrain_glyph` used.
@@ -62,16 +100,19 @@ fn draw_minimap(
     mut contexts: EguiContexts,
     noise: Res<TerrainNoise>,
     origin: Res<WorldOrigin>,
-    local_car_q: Query<&Transform, With<LocalCar>>,
+    focus: Res<PlayerFocus>,
     remote_cars_q: Query<(&CarSnapshot, &CarChassis), Without<LocalCar>>,
+    remote_planes_q: Query<&PlaneSnapshot, Without<LocalPlane>>,
+    remote_players_q: Query<(&PlayerOnFootSnapshot, &PlayerInfo), Without<LocalPlayerAccount>>,
     buildings_q: Query<&BuildingSnapshot>,
     villagers_q: Query<&VillagerSnapshot>,
 ) -> Result {
-    let Ok(local_transform) = local_car_q.single() else {
-        return Ok(());
-    };
-    let local_true = origin.to_true(local_transform.translation);
-    let forward = local_transform.forward();
+    // Centered on `PlayerFocus`, not a hardcoded `LocalCar` query — see
+    // that resource's own docs. This radar used to stay pinned on the
+    // parked car's position/heading even after stepping out of it
+    // (flying, walking); now it follows whatever you actually occupy.
+    let local_true = origin.to_true(focus.translation);
+    let forward = focus.forward;
 
     egui::Area::new(egui::Id::new("minimap"))
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
@@ -93,7 +134,7 @@ fn draw_minimap(
                     let world_x = local_true.x + dx as f64;
                     let world_z = local_true.z + dz as f64;
                     let ground_y = height_at(&noise, world_x, world_z);
-                    let relief = ground_y - local_transform.translation.y;
+                    let relief = ground_y - focus.translation.y;
                     let rect = egui::Rect::from_center_size(cell_center, egui::vec2(cell_px, cell_px));
                     painter.rect_filled(rect, 0.0, relief_color(relief));
                 }
@@ -125,14 +166,55 @@ fn draw_minimap(
                 }
             }
 
-            // Remote cars — owner-colored dots, a bit larger than a villager's.
+            // Remote cars — owner-colored dots, a bit larger than a
+            // villager's, or (see `radar_position`) a small arrow clamped
+            // to the radar's own edge if they're currently too far away to
+            // fit on it at all — still worth knowing *which direction*,
+            // rather than just vanishing off the visible map entirely.
             for (snapshot, chassis) in &remote_cars_q {
                 let true_pos = snapshot.translation.as_dvec3();
                 let dx = (true_pos.x - local_true.x) as f32;
                 let dz = (true_pos.z - local_true.z) as f32;
-                if let Some(pos) = world_to_screen(center, dx, dz) {
-                    let color = to_egui_color32(color_from_seed(chassis.color_seed));
+                let color = to_egui_color32(color_from_seed(chassis.color_seed));
+                let (pos, in_range) = radar_position(center, dx, dz);
+                if in_range {
                     painter.circle_filled(pos, 4.0, color);
+                } else {
+                    draw_edge_marker(&painter, center, pos, color);
+                }
+            }
+
+            // Remote planes — same treatment as cars above, just keyed off
+            // `PlaneSnapshot`'s own true-space `true_x`/`true_z` (planes
+            // never had a minimap presence at all before this).
+            for snapshot in &remote_planes_q {
+                let dx = (snapshot.true_x - local_true.x) as f32;
+                let dz = (snapshot.true_z - local_true.z) as f32;
+                let color = to_egui_color32(color_for_owner(snapshot.owner_player_id));
+                let (pos, in_range) = radar_position(center, dx, dz);
+                if in_range {
+                    painter.circle_filled(pos, 4.0, color);
+                } else {
+                    draw_edge_marker(&painter, center, pos, color);
+                }
+            }
+
+            // On-foot players — same treatment as cars/planes above, keyed
+            // off `PlayerOnFootSnapshot`'s own true-space position (see
+            // that component's own docs — on-foot players had no minimap
+            // presence at all before this, same as planes once didn't).
+            for (snapshot, info) in &remote_players_q {
+                if !snapshot.on_foot {
+                    continue;
+                }
+                let dx = (snapshot.true_x - local_true.x) as f32;
+                let dz = (snapshot.true_z - local_true.z) as f32;
+                let color = to_egui_color32(color_for_owner(info.player_id));
+                let (pos, in_range) = radar_position(center, dx, dz);
+                if in_range {
+                    painter.circle_filled(pos, 3.0, color);
+                } else {
+                    draw_edge_marker(&painter, center, pos, color);
                 }
             }
 

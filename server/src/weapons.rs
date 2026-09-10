@@ -6,7 +6,7 @@ use shared::combat::{Health, FIRE_COOLDOWN_SECS};
 use shared::protocol::{FireGunMsg, GunFiredMsg};
 use shared::worldspace::WorldOrigin;
 
-use crate::car_sim::{OwnedBy, PlayerIdentities};
+use crate::car_sim::PlayerIdentities;
 use crate::economy::Wallets;
 use crate::persistence::{Persistence, PersistenceCommand, WalletRow};
 
@@ -54,6 +54,9 @@ impl Default for LastFired {
 /// kick directly (see `HIT_KNOCKBACK_DELTA_V`'s docs on why this doesn't go
 /// through `physics_fx::apply_radial_impulse`); either way, broadcasts the
 /// resolved muzzle/end points so every client renders the same shot.
+/// Shooter/target matched via `CarChassis::owner_player_id`, not `OwnedBy`
+/// — see `car_sim::apply_car_input`'s docs on why a car's ownership no
+/// longer keys off a live connection entity.
 #[allow(clippy::too_many_arguments)]
 fn handle_fire_gun(
     fire: On<FromClient<FireGunMsg>>,
@@ -64,14 +67,17 @@ fn handle_fire_gun(
     identities: Res<PlayerIdentities>,
     mut wallets: ResMut<Wallets>,
     persistence: Res<Persistence>,
-    mut shooters: Query<(Entity, &OwnedBy, &Transform, &CarChassis, &mut LastFired)>,
-    mut targets: Query<(&mut Velocity, &mut Health, &OwnedBy), With<CarChassis>>,
+    mut shooters: Query<(Entity, &CarChassis, &Transform, &mut LastFired)>,
+    mut targets: Query<(&mut Velocity, &mut Health, &CarChassis)>,
 ) {
     let Some(client_entity) = fire.client_id.entity() else {
         return;
     };
-    let Some((shooter_entity, _, shooter_transform, chassis, mut last_fired)) =
-        shooters.iter_mut().find(|(_, owner, ..)| owner.0 == client_entity)
+    let Some(shooter_id) = identities.get(client_entity) else {
+        return;
+    };
+    let Some((shooter_entity, chassis, shooter_transform, mut last_fired)) =
+        shooters.iter_mut().find(|(_, chassis, ..)| chassis.owner_player_id == shooter_id)
     else {
         return;
     };
@@ -98,28 +104,25 @@ fn handle_fire_gun(
 
     let (end_local, did_hit) = match hit {
         Some((hit_entity, toi)) => {
-            if let Ok((mut velocity, mut health, target_owner)) = targets.get_mut(hit_entity) {
+            if let Ok((mut velocity, mut health, target_chassis)) = targets.get_mut(hit_entity) {
                 health.apply_damage(GUN_DAMAGE);
                 velocity.linear += forward * HIT_KNOCKBACK_DELTA_V + Vec3::Y * HIT_UPWARD_DELTA_V;
                 velocity.angular += Vec3::new(forward.z, 0.0, -forward.x) * HIT_ANGULAR_DELTA;
 
-                // Ore steal: only meaningful between two identified
-                // players (both sides need a PersistentPlayerId — see
-                // Wallets::steal_ore's docs); silently skipped otherwise
-                // rather than treating "not yet identified" as an error.
-                if let (Some(shooter_id), Some(target_id)) =
-                    (identities.get(client_entity), identities.get(target_owner.0))
-                {
-                    let stolen = wallets.steal_ore(target_id, shooter_id, ORE_STOLEN_PER_HIT);
-                    if stolen > 0.0 {
-                        for player_id in [shooter_id, target_id] {
-                            if let Some((energy, ore)) = wallets.get(player_id) {
-                                persistence.send(PersistenceCommand::SaveWallet(WalletRow {
-                                    player_id,
-                                    energy: energy as f64,
-                                    ore: ore as f64,
-                                }));
-                            }
+                // Ore steal — a target's `owner_player_id` is always a real
+                // account id (unlike the old `OwnedBy`-based lookup, this
+                // never needs a live connection to resolve one), so this no
+                // longer needs to skip an "unidentified target" case.
+                let target_id = target_chassis.owner_player_id;
+                let stolen = wallets.steal_ore(target_id, shooter_id, ORE_STOLEN_PER_HIT);
+                if stolen > 0.0 {
+                    for player_id in [shooter_id, target_id] {
+                        if let Some((energy, ore)) = wallets.get(player_id) {
+                            persistence.send(PersistenceCommand::SaveWallet(WalletRow {
+                                player_id,
+                                energy: energy as f64,
+                                ore: ore as f64,
+                            }));
                         }
                     }
                 }

@@ -7,7 +7,8 @@ use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 
-use crate::car::{CarChassis, CarResetEvent, LocalCar};
+use crate::car::{CarChassis, CarResetEvent, DrivingCarId};
+use crate::pilot::PassengerCarId;
 
 /// How far in front of whatever the camera would clip into to hold it —
 /// enough that terrain right at the lens doesn't poke through into view.
@@ -83,6 +84,11 @@ pub struct CarCamera;
 fn spawn_camera(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
+        // Default far plane (1000.0) would clip `stars.rs`'s starfield,
+        // which sits well past any real terrain/gameplay draw distance on
+        // purpose (see that module's own docs) — nothing else in the
+        // scene needs the extra range, so widening this costs nothing.
+        Projection::Perspective(PerspectiveProjection { far: 8000.0, ..default() }),
         Transform::from_xyz(0.0, 5.0, -10.0).looking_at(Vec3::ZERO, Vec3::Y),
         CarCamera,
         Hdr,
@@ -99,12 +105,30 @@ fn spawn_camera(mut commands: Commands) {
     ));
 }
 
-fn toggle_camera_mode(keyboard: Res<ButtonInput<KeyCode>>, mut mode: ResMut<CameraMode>) {
-    if keyboard.just_pressed(KeyCode::KeyC) {
-        *mode = match *mode {
-            CameraMode::Chase => CameraMode::Cockpit,
-            CameraMode::Cockpit => CameraMode::Chase,
-        };
+/// `C`: toggles Chase/Cockpit — but *which* of the two independent camera
+/// modes (the car's own `CameraMode`, or the plane's separate
+/// `PlaneCameraMode` — see that resource's own docs on why they aren't the
+/// same one) depends on `ControlMode` at the moment it's pressed, so the
+/// same key does the intuitive thing for whichever vehicle you're actually
+/// in right now.
+fn toggle_camera_mode(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    chat_open: Res<crate::chat::ChatOpen>,
+    control_mode: Res<crate::pilot::ControlMode>,
+    mut mode: ResMut<CameraMode>,
+    mut plane_mode: ResMut<crate::aircraft::PlaneCameraMode>,
+) {
+    if chat_open.0 || !keyboard.just_pressed(KeyCode::KeyC) {
+        return;
+    }
+    let flip = |m: CameraMode| match m {
+        CameraMode::Chase => CameraMode::Cockpit,
+        CameraMode::Cockpit => CameraMode::Chase,
+    };
+    if *control_mode == crate::pilot::ControlMode::Plane {
+        plane_mode.0 = flip(plane_mode.0);
+    } else {
+        *mode = flip(*mode);
     }
 }
 
@@ -143,13 +167,37 @@ fn avoid_clipping(
 fn update_camera(
     time: Res<Time>,
     mode: Res<CameraMode>,
+    control_mode: Res<crate::pilot::ControlMode>,
+    driving_car: Res<DrivingCarId>,
+    passenger_car: Res<PassengerCarId>,
     orbit: Res<OrbitLook>,
     rapier_context: ReadRapierContext,
-    chassis_q: Query<(Entity, &GlobalTransform, &CarChassis), With<LocalCar>>,
+    // Not `With<LocalCar>`: a passenger's car is by definition someone
+    // else's (see `PassengerCarId`'s own docs), so this has to be able to
+    // find *any* car, not just an owned one — `target_car_id` below is
+    // what actually narrows it down to the one right car.
+    chassis_q: Query<(Entity, &GlobalTransform, &CarChassis)>,
     mut camera_q: Query<&mut Transform, With<CarCamera>>,
     mut reset_events: MessageReader<CarResetEvent>,
 ) {
-    let Ok((chassis_entity, chassis_gt, chassis)) = chassis_q.single() else {
+    // While flying or on foot, `aircraft::update_plane_camera` or
+    // `pilot::update_pilot_camera` drives this same camera instead — all
+    // four mutually exclusive on `pilot::ControlMode` so they never fight
+    // over the same `Transform` in one frame. A passenger gets the exact
+    // same chase/cockpit view a driver would, just following someone
+    // else's car — riding along with nothing to do but watch shouldn't
+    // also mean staring at a fixed, un-chasing camera.
+    let target_car_id = match *control_mode {
+        crate::pilot::ControlMode::Car => driving_car.0,
+        crate::pilot::ControlMode::Passenger => passenger_car.0,
+        _ => return,
+    };
+    let Some(target_car_id) = target_car_id else {
+        return;
+    };
+    let Some((chassis_entity, chassis_gt, chassis)) =
+        chassis_q.iter().find(|(_, _, chassis)| chassis.car_id == target_car_id)
+    else {
         return;
     };
     let Ok(mut camera_tf) = camera_q.single_mut() else {

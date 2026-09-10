@@ -51,10 +51,11 @@ pub struct RecordingActive(pub bool);
 
 fn toggle_recording(
     keyboard: Res<ButtonInput<KeyCode>>,
+    chat_open: Res<crate::chat::ChatOpen>,
     mut recording: ResMut<Recording>,
     mut active: ResMut<RecordingActive>,
 ) {
-    if !keyboard.just_pressed(KeyCode::KeyL) {
+    if chat_open.0 || !keyboard.just_pressed(KeyCode::KeyL) {
         return;
     }
 
@@ -123,7 +124,11 @@ fn capture_tick(
     }
     session.time_since_capture = 0.0;
 
-    let Ok((car_entity, car_gt)) = car_q.single() else {
+    // `.iter().next()`, not `.single()` — a player can own several cars
+    // now (see `car.rs`'s top-level docs), so this just captures whichever
+    // one happens to be first rather than recording nothing at all for
+    // anyone who owns more than one.
+    let Some((car_entity, car_gt)) = car_q.iter().next() else {
         return;
     };
     let transform = car_gt.compute_transform();

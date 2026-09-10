@@ -6,12 +6,13 @@ use std::thread;
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 use bevy_replicon::prelude::*;
+use shared::car_physics::CarChassis;
 use shared::protocol::CarSnapshot;
 use shared::terrain_gen::TerrainNoise;
 use shared::worldspace::WorldOrigin;
 
-use crate::car_sim::{do_world_regen, CurrentWorldState, OpList, OwnedBy, PlayerRegistry, SpawnAnchor};
-use crate::terrain_phys::ServerTerrainEntity;
+use crate::car_sim::{do_world_regen, CurrentWorldState, OpList, PlayerIdentities, PlayerRegistry, SpawnAnchor};
+use crate::terrain_phys::LoadedChunks;
 
 /// A simple operator console on the server's own stdin — since this is a
 /// headless process with no window, this is the entire "admin UI." Reading
@@ -71,7 +72,8 @@ fn process_console_input(
     mut regen_requests: MessageWriter<ConsoleRegenRequested>,
     mut op_list: ResMut<OpList>,
     registry: Res<PlayerRegistry>,
-    positions: Query<(&OwnedBy, &CarSnapshot)>,
+    identities: Res<PlayerIdentities>,
+    positions: Query<(&CarChassis, &CarSnapshot)>,
 ) {
     let Ok(receiver) = lines.0.lock() else {
         return;
@@ -98,10 +100,12 @@ fn process_console_input(
                 for (index, entity) in registry.iter() {
                     any = true;
                     let is_op = op_list.is_op(entity);
-                    let pos = positions
-                        .iter()
-                        .find(|(owner, _)| owner.0 == entity)
-                        .map(|(_, snap)| snap.translation);
+                    let pos = identities.get(entity).and_then(|player_id| {
+                        positions
+                            .iter()
+                            .find(|(chassis, _)| chassis.owner_player_id == player_id)
+                            .map(|(_, snap)| snap.translation)
+                    });
                     println!("  #{index}  client={entity}  op={is_op}  pos={pos:?}");
                 }
                 if !any {
@@ -161,8 +165,8 @@ fn apply_console_regen(
     mut origin: ResMut<WorldOrigin>,
     mut anchor: ResMut<SpawnAnchor>,
     mut world_state: ResMut<CurrentWorldState>,
-    terrain_entities: Query<Entity, With<ServerTerrainEntity>>,
-    mut cars: Query<(&mut Transform, &mut Velocity, &mut ExternalForce, &mut CarSnapshot), With<OwnedBy>>,
+    mut loaded_chunks: ResMut<LoadedChunks>,
+    mut cars: Query<(&mut Transform, &mut Velocity, &mut ExternalForce), With<CarChassis>>,
 ) {
     if regen_requests.read().next().is_none() {
         return;
@@ -173,7 +177,7 @@ fn apply_console_regen(
         &mut origin,
         &mut anchor,
         &mut world_state,
-        &terrain_entities,
+        &mut loaded_chunks,
         &mut cars,
     );
     commands.server_trigger(ToClients {
