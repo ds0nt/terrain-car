@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use shared::buildings::{BuildingKind, STARTING_ENERGY, STARTING_ORE};
 use shared::deposits::is_near_deposit;
-use shared::protocol::{BuildingSnapshot, DestroyBuildingMsg, PlaceBuildingMsg, Wallet};
+use shared::protocol::{BuildingSnapshot, DestroyBuildingMsg, PlaceBuildingMsg, TurretSnapshot, Wallet};
 use shared::terrain_gen::{height_at, TerrainNoise};
 use shared::worldspace::WorldOrigin;
 
@@ -159,8 +159,12 @@ fn apply_loaded_state(
 /// the server's own authoritative Rapier world — which is what lets a
 /// Ramp start on top of another existing Ramp instead of always sitting on
 /// raw terrain).
+/// `pub(crate)` so `tank_sim`/`dropship_sim`'s own tests can exercise this
+/// exact production spawn path directly, rather than hand-building a
+/// `BuildingSnapshot` some other way that might not actually match what a
+/// real placement produces.
 #[allow(clippy::too_many_arguments)]
-fn spawn_building(
+pub(crate) fn spawn_building(
     commands: &mut Commands,
     origin: &WorldOrigin,
     id: Uuid,
@@ -176,6 +180,14 @@ fn spawn_building(
         BuildingSnapshot { id, kind, owner_player_id, true_x, true_z, build_complete_at, rotation_y, ground_y },
         Replicated,
     ));
+    if kind.is_turret() {
+        // Every client needs to see the same rotating head — see
+        // `TurretSnapshot`'s own docs on why this isn't folded into
+        // `BuildingSnapshot`. `server::turrets` owns updating both of these
+        // once this building actually completes; `TurretRuntime` is its
+        // server-only fire-rate gate, never replicated.
+        entity.insert((TurretSnapshot::default(), crate::turrets::TurretRuntime::default()));
+    }
 
     let local = (bevy::math::DVec3::new(true_x, 0.0, true_z) - origin.offset).as_vec3();
     if kind.uses_slab_geometry() {

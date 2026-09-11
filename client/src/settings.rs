@@ -1,4 +1,5 @@
 use bevy::light::DirectionalLightShadowMap;
+use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::window::{MonitorSelection, PresentMode, PrimaryWindow, WindowMode};
 use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
@@ -6,6 +7,7 @@ use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
 use crate::camera::CarCamera;
 use crate::chat::ChatOpen;
 use crate::cosmetics_ui::CosmeticsPanelOpen;
+use crate::render_scale::{RenderScale, RENDER_SCALE_MIN};
 use crate::terrain::ViewDistance;
 
 /// `F10` opens/closes a settings menu — graphics options for now, plus a
@@ -112,13 +114,17 @@ impl ShadowQuality {
 #[allow(clippy::too_many_arguments)]
 fn draw_settings(
     mut contexts: EguiContexts,
+    mut commands: Commands,
     mut open: ResMut<SettingsOpen>,
     mut cosmetics_open: ResMut<CosmeticsPanelOpen>,
     mut view_distance: ResMut<ViewDistance>,
+    mut render_scale: ResMut<RenderScale>,
     mut shadow_map: ResMut<DirectionalLightShadowMap>,
     mut sun_q: Query<&mut DirectionalLight>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
-    mut camera_q: Query<&mut Projection, With<CarCamera>>,
+    mut camera_q: Query<(Entity, &mut Projection, Option<&mut Msaa>, Has<Bloom>), With<CarCamera>>,
+    mut audio_devices: ResMut<crate::audio::AudioDevices>,
+    mut selected_device: ResMut<crate::audio::SelectedAudioDevice>,
 ) -> Result {
     if !open.0 {
         return Ok(());
@@ -181,18 +187,66 @@ fn draw_settings(
                             }
                         });
                 });
-            }
-            if let Ok(mut projection) = camera_q.single_mut()
-                && let Projection::Perspective(perspective) = &mut *projection
-            {
-                let mut fov_deg = perspective.fov.to_degrees();
+
+                // Distinct from the resolution picker above: that resizes
+                // the *window* (moot in fullscreen — the window already
+                // *is* the display). This instead renders the 3D world
+                // internally at a lower pixel count and upscales it to
+                // fill whatever the window/display actually is — real GPU
+                // cost savings independent of display resolution, the
+                // "render resolution" scaler games like Dota 2 expose (see
+                // `render_scale.rs`'s own docs for how). The UI/HUD/chat
+                // stay crisp at 100% regardless of this slider.
                 ui.add_space(4.0);
-                if ui.add(egui::Slider::new(&mut fov_deg, FOV_RANGE_DEG).text("Field of view")).changed() {
-                    perspective.fov = fov_deg.to_radians();
+                let mut render_scale_pct = (render_scale.scale * 100.0).round() as i32;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut render_scale_pct, (RENDER_SCALE_MIN * 100.0) as i32..=100)
+                            .suffix("%")
+                            .text("Render resolution"),
+                    )
+                    .changed()
+                {
+                    render_scale.scale = render_scale_pct as f32 / 100.0;
+                }
+            }
+            if let Ok((camera_entity, mut projection, msaa, has_bloom)) = camera_q.single_mut() {
+                if let Projection::Perspective(perspective) = &mut *projection {
+                    let mut fov_deg = perspective.fov.to_degrees();
+                    ui.add_space(4.0);
+                    if ui.add(egui::Slider::new(&mut fov_deg, FOV_RANGE_DEG).text("Field of view")).changed() {
+                        perspective.fov = fov_deg.to_radians();
+                    }
+                }
+
+                ui.add_space(20.0);
+                ui.separator();
+                ui.add_space(16.0);
+                ui.label(egui::RichText::new("Effects").strong());
+                ui.add_space(8.0);
+
+                let mut bloom_enabled = has_bloom;
+                if ui.checkbox(&mut bloom_enabled, "Bloom").changed() {
+                    if bloom_enabled {
+                        commands.entity(camera_entity).insert(Bloom::NATURAL);
+                    } else {
+                        commands.entity(camera_entity).remove::<Bloom>();
+                    }
+                }
+                if let Some(mut msaa) = msaa {
+                    let mut msaa_on = *msaa != Msaa::Off;
+                    if ui.checkbox(&mut msaa_on, "Anti-aliasing").changed() {
+                        *msaa = if msaa_on { Msaa::Sample4 } else { Msaa::Off };
+                    }
                 }
             }
 
-            ui.add_space(4.0);
+            ui.add_space(20.0);
+            ui.separator();
+            ui.add_space(16.0);
+
+            ui.label(egui::RichText::new("World").strong());
+            ui.add_space(8.0);
             let mut view_distance_chunks = view_distance.chunks;
             if ui
                 .add(egui::Slider::new(&mut view_distance_chunks, VIEW_DISTANCE_RANGE).text("View distance"))
@@ -222,6 +276,37 @@ fn draw_settings(
                     shadow_map.size = selected.map_size();
                 }
             }
+
+            ui.add_space(20.0);
+            ui.separator();
+            ui.add_space(16.0);
+
+            ui.label(egui::RichText::new("Audio").strong());
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let current_label =
+                    selected_device.name.as_deref().unwrap_or("System Default").to_string();
+                egui::ComboBox::from_label("Output device")
+                    .selected_text(current_label)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(selected_device.name.is_none(), "System Default").clicked() {
+                            selected_device.name = None;
+                        }
+                        for output in &audio_devices.outputs {
+                            let name = output.to_string();
+                            let selected = selected_device.name.as_deref() == Some(name.as_str());
+                            if ui.selectable_label(selected, &name).clicked() {
+                                selected_device.name = Some(name);
+                            }
+                        }
+                    });
+                // `Sense::CLICK`, not the focusable default — see
+                // `building_ui.rs`'s own `building_button` docs on why
+                // every clickable in this UI is mouse-only.
+                if ui.add(egui::Button::new("Refresh").sense(egui::Sense::CLICK)).clicked() {
+                    crate::audio::refresh_audio_devices_now(&mut audio_devices);
+                }
+            });
 
             ui.add_space(20.0);
             ui.separator();

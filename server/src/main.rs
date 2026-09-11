@@ -4,13 +4,16 @@ mod auth;
 mod car_sim;
 mod chat;
 mod console;
+mod dropship_sim;
 mod economy;
 mod lightning;
 mod net;
 mod persistence;
 mod physics_fx;
 mod pings;
+mod tank_sim;
 mod terrain_phys;
+mod turrets;
 mod villagers;
 mod weapons;
 
@@ -75,7 +78,16 @@ fn main() {
         economy::EconomyPlugin,
         villagers::VillagersPlugin,
     ))
-    .add_plugins((chat::ChatPlugin, auth::AuthPlugin, pings::PingsPlugin, aircraft::AircraftPlugin, ai::AiPlugin));
+    .add_plugins((
+        chat::ChatPlugin,
+        auth::AuthPlugin,
+        pings::PingsPlugin,
+        aircraft::AircraftPlugin,
+        ai::AiPlugin,
+        tank_sim::TankSimPlugin,
+        dropship_sim::DropshipSimPlugin,
+        turrets::TurretsPlugin,
+    ));
 
     // Registers replicated components/events — must use the exact same
     // function the client calls, so wire IDs (assigned in registration

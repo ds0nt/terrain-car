@@ -12,9 +12,11 @@ use crate::auth_ui::LocalPlayerId;
 use crate::building_placement::SelectBuildingKind;
 use crate::building_render::base_color_for_kind;
 use crate::car::DrivingCarId;
+use crate::dropship::{send_dropship_recall, DrivingDropshipId};
 use crate::owner_color::to_egui_color32;
 use crate::player_account::LocalPlayerAccount;
 use crate::selection::Selected;
+use crate::tank::{send_tank_recall, DrivingTankId};
 
 /// Always-visible build bar pinned to the bottom of the screen, plus the
 /// recall-to-Hangar binding (`H`, usable anytime, not just here). Clicking
@@ -46,12 +48,15 @@ impl Plugin for BuildingUiPlugin {
 /// unconditionally" stopped being what was wanted), so those two only
 /// fire when there's actually an id to send; `RecallPlayerMsg` needs none
 /// and only makes sense exactly when neither of those does.
+#[allow(clippy::too_many_arguments)]
 fn send_recall_input(
     keyboard: Res<ButtonInput<KeyCode>>,
     chat_open: Res<crate::chat::ChatOpen>,
     mode: Res<crate::pilot::ControlMode>,
     driving_car: Res<DrivingCarId>,
     driving_plane: Res<DrivingPlaneId>,
+    driving_tank: Res<DrivingTankId>,
+    driving_dropship: Res<DrivingDropshipId>,
     mut commands: Commands,
 ) {
     if !chat_open.0 && keyboard.just_pressed(KeyCode::KeyH) {
@@ -59,13 +64,17 @@ fn send_recall_input(
             commands.client_trigger(RecallToHangarMsg { car_id });
         } else if let Some(plane_id) = driving_plane.0 {
             commands.client_trigger(RecallPlaneMsg { plane_id });
+        } else if let Some(tank_id) = driving_tank.0 {
+            send_tank_recall(&mut commands, tank_id);
+        } else if let Some(dropship_id) = driving_dropship.0 {
+            send_dropship_recall(&mut commands, dropship_id);
         } else if *mode == crate::pilot::ControlMode::OnFoot {
             commands.client_trigger(RecallPlayerMsg);
         }
     }
 }
 
-const BUILDING_KINDS: [BuildingKind; 9] = [
+const BUILDING_KINDS: [BuildingKind; 12] = [
     BuildingKind::Hangar,
     BuildingKind::EnergyGenerator,
     BuildingKind::ExtractionFacility,
@@ -75,6 +84,9 @@ const BUILDING_KINDS: [BuildingKind; 9] = [
     BuildingKind::Wall,
     BuildingKind::LandFactory,
     BuildingKind::AirFactory,
+    BuildingKind::WarFactory,
+    BuildingKind::Dropyard,
+    BuildingKind::Turret,
 ];
 
 const ICON_SIZE: f32 = 48.0;
@@ -148,7 +160,7 @@ fn draw_build_bar(
                         }
                     }
                     ui.separator();
-                    ui.label("H: recall car/plane to base");
+                    ui.label("H: recall vehicle to base");
                 });
             });
         });

@@ -204,6 +204,13 @@ pub fn collider_shape(kind: BuildingKind) -> ColliderShape {
         BuildingKind::ExtractionFacility => ColliderShape::Cylinder { half_height: 2.0, radius: 0.8 },
         BuildingKind::LandFactory => ColliderShape::Cuboid { half_x: 3.0, half_y: 1.75, half_z: 3.0 },
         BuildingKind::AirFactory => ColliderShape::Cuboid { half_x: 3.5, half_y: 2.0, half_z: 3.5 },
+        BuildingKind::WarFactory => ColliderShape::Cuboid { half_x: 3.5, half_y: 2.0, half_z: 3.5 },
+        BuildingKind::Dropyard => ColliderShape::Cuboid { half_x: 4.5, half_y: 2.25, half_z: 4.5 },
+        // Just the base pad — the rotating head sits on top as its own
+        // child entity (`client::building_render`'s turret variant,
+        // `server::turrets`'s aim state), same "collider only covers the
+        // stationary part" split a `Tank`'s own hull/turret pair uses.
+        BuildingKind::Turret => ColliderShape::Cuboid { half_x: 1.2, half_y: 1.0, half_z: 1.2 },
         BuildingKind::Ramp | BuildingKind::Road | BuildingKind::Platform | BuildingKind::Wall => {
             unreachable!("{kind:?} uses slab_transform, never collider_shape")
         }
@@ -278,6 +285,25 @@ pub enum BuildingKind {
     /// all; a real production queue is a reasonable follow-up once there's
     /// more than one aircraft kind to actually choose between.
     AirFactory,
+    /// Spawns one `Tank` for its owner the moment it completes — full
+    /// parity with `Hangar`/`AirFactory` spawning a car/plane, just for the
+    /// vehicle described in `shared::tank_physics`. One automatic tank per
+    /// completed factory, same v1-simplicity reasoning `AirFactory`'s own
+    /// docs give for a scout plane (no manual queue).
+    WarFactory,
+    /// Spawns one `Dropship` for its owner the moment it completes — same
+    /// "one vehicle per completed factory" shape as `WarFactory`/
+    /// `AirFactory`, just for the multi-seat transport (1 pilot + 4
+    /// passenger seats, see `protocol::DropshipSnapshot`).
+    Dropyard,
+    /// A stationary, auto-targeting defense structure — not a factory (it
+    /// doesn't spawn anything else), it *is* the unit: a rotating "turret
+    /// head" (see `server::turrets`) that aims at and fires on the nearest
+    /// enemy within range on its own, no manual control. Conceptually it's
+    /// a vehicle with zero mobility (it aims and fires exactly like a
+    /// `Tank`'s own turret does, sharing that same aim/fire shape) that
+    /// just happens to be placed and built like any other building.
+    Turret,
 }
 
 impl BuildingKind {
@@ -299,6 +325,12 @@ impl BuildingKind {
             // a villager instead of a plane).
             BuildingKind::LandFactory => (80.0, 60.0),
             BuildingKind::AirFactory => (90.0, 70.0),
+            // A tank/dropship each cost noticeably more than the car/plane
+            // factories they parallel — combat/transport hardware, not a
+            // starter vehicle.
+            BuildingKind::WarFactory => (140.0, 120.0),
+            BuildingKind::Dropyard => (160.0, 150.0),
+            BuildingKind::Turret => (70.0, 60.0),
         }
     }
 
@@ -317,6 +349,9 @@ impl BuildingKind {
             BuildingKind::Wall => 10.0,
             BuildingKind::LandFactory => 30.0,
             BuildingKind::AirFactory => 35.0,
+            BuildingKind::WarFactory => 45.0,
+            BuildingKind::Dropyard => 50.0,
+            BuildingKind::Turret => 20.0,
         }
     }
 
@@ -333,7 +368,10 @@ impl BuildingKind {
             | BuildingKind::Platform
             | BuildingKind::Wall
             | BuildingKind::LandFactory
-            | BuildingKind::AirFactory => (0.0, 0.0),
+            | BuildingKind::AirFactory
+            | BuildingKind::WarFactory
+            | BuildingKind::Dropyard
+            | BuildingKind::Turret => (0.0, 0.0),
             BuildingKind::EnergyGenerator => (1.5, 0.0),
             BuildingKind::ExtractionFacility => (0.0, 1.0),
         }
@@ -379,6 +417,27 @@ impl BuildingKind {
         matches!(self, BuildingKind::Hangar)
     }
 
+    /// Whether this kind spawns a `Tank` for its owner the moment it
+    /// completes (`server::tank_sim::spawn_tanks_from_war_factories`) —
+    /// see `WarFactory`'s own docs.
+    pub fn spawns_tank(self) -> bool {
+        matches!(self, BuildingKind::WarFactory)
+    }
+
+    /// Whether this kind spawns a `Dropship` for its owner the moment it
+    /// completes (`server::dropship_sim::spawn_dropships_from_dropyards`) —
+    /// see `Dropyard`'s own docs.
+    pub fn spawns_dropship(self) -> bool {
+        matches!(self, BuildingKind::Dropyard)
+    }
+
+    /// Whether this kind is itself a stationary auto-targeting defense unit
+    /// (`server::turrets`) rather than an ordinary economy/structural
+    /// building — see `Turret`'s own docs.
+    pub fn is_turret(self) -> bool {
+        matches!(self, BuildingKind::Turret)
+    }
+
     /// Stable string form for the `buildings.kind` database column (a
     /// plain `text` column — see `server/migrations/0001_init.sql`) —
     /// deliberately not `serde`'s `Serialize`/`Deserialize` (those drive
@@ -396,6 +455,9 @@ impl BuildingKind {
             BuildingKind::Wall => "wall",
             BuildingKind::LandFactory => "land_factory",
             BuildingKind::AirFactory => "air_factory",
+            BuildingKind::WarFactory => "war_factory",
+            BuildingKind::Dropyard => "dropyard",
+            BuildingKind::Turret => "turret",
         }
     }
 
@@ -410,6 +472,9 @@ impl BuildingKind {
             "wall" => Some(BuildingKind::Wall),
             "land_factory" => Some(BuildingKind::LandFactory),
             "air_factory" => Some(BuildingKind::AirFactory),
+            "war_factory" => Some(BuildingKind::WarFactory),
+            "dropyard" => Some(BuildingKind::Dropyard),
+            "turret" => Some(BuildingKind::Turret),
             _ => None,
         }
     }
@@ -419,7 +484,7 @@ impl BuildingKind {
 mod tests {
     use super::*;
 
-    const ALL_KINDS: [BuildingKind; 9] = [
+    const ALL_KINDS: [BuildingKind; 12] = [
         BuildingKind::Hangar,
         BuildingKind::EnergyGenerator,
         BuildingKind::ExtractionFacility,
@@ -429,6 +494,9 @@ mod tests {
         BuildingKind::Wall,
         BuildingKind::LandFactory,
         BuildingKind::AirFactory,
+        BuildingKind::WarFactory,
+        BuildingKind::Dropyard,
+        BuildingKind::Turret,
     ];
     const STARTER_KINDS: [BuildingKind; 3] =
         [BuildingKind::Hangar, BuildingKind::EnergyGenerator, BuildingKind::ExtractionFacility];
@@ -525,6 +593,27 @@ mod tests {
     fn only_hangar_spawns_a_car() {
         for kind in ALL_KINDS {
             assert_eq!(kind.spawns_car(), kind == BuildingKind::Hangar);
+        }
+    }
+
+    #[test]
+    fn only_war_factory_spawns_a_tank() {
+        for kind in ALL_KINDS {
+            assert_eq!(kind.spawns_tank(), kind == BuildingKind::WarFactory);
+        }
+    }
+
+    #[test]
+    fn only_dropyard_spawns_a_dropship() {
+        for kind in ALL_KINDS {
+            assert_eq!(kind.spawns_dropship(), kind == BuildingKind::Dropyard);
+        }
+    }
+
+    #[test]
+    fn only_turret_is_a_turret() {
+        for kind in ALL_KINDS {
+            assert_eq!(kind.is_turret(), kind == BuildingKind::Turret);
         }
     }
 }

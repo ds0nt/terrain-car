@@ -6,6 +6,7 @@ pub mod combat;
 pub mod deposits;
 pub mod obstacles;
 pub mod owner;
+pub mod tank_physics;
 pub mod time;
 pub mod protocol;
 pub mod terrain_gen;

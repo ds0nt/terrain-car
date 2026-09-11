@@ -45,8 +45,10 @@ impl Plugin for AiPlugin {
 /// `owner_player_id` matching a real logged-in player, which the nil UUID
 /// can never do — so an AI vehicle is simply invisible to every one of
 /// those paths (no floating nametag, can't be recalled by a player, etc.)
-/// without needing its own special-cased exclusion anywhere.
-const AI_OWNER: Uuid = Uuid::nil();
+/// without needing its own special-cased exclusion anywhere. `pub(crate)`
+/// — `server::turrets`'s own auto-aim also excludes this id, so a defense
+/// turret doesn't treat neutral patrol AI as a hostile target.
+pub(crate) const AI_OWNER: Uuid = Uuid::nil();
 
 /// True-space patrol point every AI vehicle heads for — hardcoded for this
 /// starter (see this module's own top-level docs). A real "assign a
@@ -162,16 +164,18 @@ fn apply_set_plane_patrol(
 /// "atan2(dx, dz)" convention every other facing-toward-a-point
 /// calculation in this game already uses (see `building_placement.rs`'s
 /// own docs on this exact convention — 0 faces `+Z`, increasing toward
-/// `+X`).
-fn bearing_to(from_x: f64, from_z: f64, to_x: f64, to_z: f64) -> f32 {
+/// `+X`). `pub(crate)` — `server::turrets`'s own auto-aim reuses this exact
+/// bearing math rather than duplicating it.
+pub(crate) fn bearing_to(from_x: f64, from_z: f64, to_x: f64, to_z: f64) -> f32 {
     ((to_x - from_x) as f32).atan2((to_z - from_z) as f32)
 }
 
 /// Wraps an angle (typically a `desired - current` bearing difference) to
 /// `(-PI, PI]` — without this, a target almost directly behind (a
 /// difference near `+-TAU`) would read as needing to turn nearly all the
-/// way around the *long* way instead of the short way.
-fn normalize_angle(angle: f32) -> f32 {
+/// way around the *long* way instead of the short way. `pub(crate)` — see
+/// `bearing_to`'s own docs.
+pub(crate) fn normalize_angle(angle: f32) -> f32 {
     (angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
 }
 

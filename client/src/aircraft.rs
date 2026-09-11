@@ -9,6 +9,7 @@ use crate::auth_ui::LocalPlayerId;
 use crate::camera::{CameraMode, CarCamera};
 use crate::owner_color::color_for_owner;
 use crate::pilot::ControlMode;
+use crate::thrusters::{spawn_thrusters, sync_thruster_glow, ThrusterAxis, ThrusterMount};
 use crate::worldspace::WorldOrigin;
 
 /// Scout Plane rendering/flight — see `shared::protocol::PlaneSnapshot`'s
@@ -35,6 +36,7 @@ impl Plugin for AircraftPlugin {
                     read_plane_input,
                     sync_plane_transforms,
                     update_plane_camera,
+                    sync_plane_thrusters,
                 )
                     .chain(),
             )
@@ -148,6 +150,7 @@ fn init_plane_visuals(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    flame_effect: Res<crate::thrusters::ThrusterFlameEffect>,
     planes: Query<&PlaneSnapshot>,
 ) {
     let Ok(snapshot) = planes.get(insert.entity) else {
@@ -185,6 +188,28 @@ fn init_plane_visuals(
             MeshMaterial3d(material),
             Transform::from_xyz(0.0, 0.5, 1.5),
         ));
+
+        // Directional thruster nozzles — see `thrusters.rs`'s own module
+        // docs for why every "which way am I steering" axis gets its own
+        // pair, mounted roughly where a real RCS cluster would sit: main
+        // engine at the tail, reverse/yaw at the nose, pitch top/bottom of
+        // the tail, roll out at the wingtips.
+        spawn_thrusters(
+            parent,
+            &mut meshes,
+            &mut materials,
+            &flame_effect.0,
+            &[
+                ThrusterMount { offset: Vec3::new(0.0, 0.0, 1.75), axis: ThrusterAxis::ThrottleForward },
+                ThrusterMount { offset: Vec3::new(0.0, 0.0, -1.75), axis: ThrusterAxis::ThrottleReverse },
+                ThrusterMount { offset: Vec3::new(0.6, 0.0, -1.5), axis: ThrusterAxis::YawPositive },
+                ThrusterMount { offset: Vec3::new(-0.6, 0.0, -1.5), axis: ThrusterAxis::YawNegative },
+                ThrusterMount { offset: Vec3::new(0.0, 0.4, 1.4), axis: ThrusterAxis::PitchPositive },
+                ThrusterMount { offset: Vec3::new(0.0, -0.4, 1.4), axis: ThrusterAxis::PitchNegative },
+                ThrusterMount { offset: Vec3::new(2.9, 0.0, 0.1), axis: ThrusterAxis::RollPositive },
+                ThrusterMount { offset: Vec3::new(-2.9, 0.0, 0.1), axis: ThrusterAxis::RollNegative },
+            ],
+        );
     });
 }
 
@@ -413,4 +438,23 @@ pub fn update_plane_camera(
 
     camera_tf.translation = camera_tf.translation.lerp(desired_translation, lerp_factor);
     camera_tf.rotation = camera_tf.rotation.slerp(desired_rotation, lerp_factor);
+}
+
+/// Lights the piloted plane's own thruster nozzles from the live
+/// `PlaneInput` stick — see `thrusters.rs`'s own module docs on why only
+/// the plane you're actually flying ever lights up.
+fn sync_plane_thrusters(
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    input: Res<PlaneInput>,
+    driving: Res<DrivingPlaneId>,
+    planes: Query<(&PlaneSnapshot, &Children), With<LocalPlane>>,
+    mut nozzles: crate::thrusters::NozzleQuery,
+) {
+    let Some(driving_id) = driving.0 else {
+        return;
+    };
+    let Some((_, children)) = planes.iter().find(|(snapshot, _)| snapshot.plane_id == driving_id) else {
+        return;
+    };
+    sync_thruster_glow(&mut materials, children, &mut nozzles, input.throttle, input.yaw, input.pitch, input.roll);
 }

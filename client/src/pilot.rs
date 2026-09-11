@@ -9,16 +9,22 @@ use bevy_rapier3d::prelude::{
 use bevy_replicon::prelude::ClientTriggerExt;
 use shared::car_physics::{CarChassis, CarInput};
 use shared::protocol::{
-    AuthResultMsg, BoardPassengerMsg, CarInputMsg, CarSnapshot, ExitPassengerMsg, ExitPlaneMsg, PlaneInputMsg,
-    PlaneSnapshot, PlayerPositionMsg, TeleportMsg,
+    AuthResultMsg, BoardDropshipMsg, BoardPassengerMsg, BuildingSnapshot, CarInputMsg, CarSnapshot, DropshipInputMsg,
+    ExitDropshipMsg, ExitDropshipPassengerMsg, ExitPassengerMsg, ExitPlaneMsg, PlaneInputMsg, PlaneSnapshot,
+    PlayerPositionMsg, TankInputMsg, TeleportMsg, TurretSnapshot,
 };
 use shared::terrain_gen::{height_at, TerrainNoise};
 use uuid::Uuid;
+
+use shared::protocol::{DropshipSnapshot, TankSnapshot};
+use shared::tank_physics::TankChassis;
 
 use crate::aircraft::{DrivingPlaneId, LocalPlane};
 use crate::auth_ui::AuthState;
 use crate::camera::CarCamera;
 use crate::car::{DrivingCarId, LocalCar};
+use crate::dropship::{DrivingDropshipId, LocalDropship, PassengerDropshipId};
+use crate::tank::{DrivingTankId, LocalTank};
 use crate::worldspace::WorldOrigin;
 
 /// `F`: step out of whichever vehicle you're in and walk around, or (once
@@ -58,6 +64,14 @@ impl Plugin for PilotPlugin {
                     toggle_menu.run_if(crate::chat::chat_closed),
                     manage_cursor_confinement,
                     handle_vehicle_key.run_if(crate::chat::chat_closed),
+                    // Runs right after `handle_vehicle_key` in the same
+                    // chain, not merged into it (Bevy's `SystemParam` tuple
+                    // impl tops out at 16 elements — `handle_vehicle_key`
+                    // already sits at that limit) — see this function's own
+                    // docs for the one narrow edge case that ordering
+                    // choice accepts.
+                    handle_tank_dropship_key.run_if(crate::chat::chat_closed),
+                    handle_turret_key.run_if(crate::chat::chat_closed),
                     look_pilot,
                     update_pilot_camera,
                     sync_player_focus,
@@ -134,6 +148,23 @@ pub enum ControlMode {
     /// equivalents all gate on `ControlMode::Car`/`Plane` specifically),
     /// so a passenger genuinely cannot drive — only watch.
     Passenger,
+    /// Driving a `Tank` — see `crate::tank::DrivingTankId` for which one.
+    /// Same mutual-exclusion role `Car` plays for `car.rs`.
+    Tank,
+    /// Piloting a `Dropship` — see `crate::dropship::DrivingDropshipId`.
+    /// Same role `Plane` plays for `aircraft.rs`.
+    DropshipPilot,
+    /// Riding along in someone else's (or your own, non-piloting) dropship
+    /// seat — see `crate::dropship::PassengerDropshipId`. Same role
+    /// `Passenger` plays for a car, just for one of a dropship's four
+    /// independent seats.
+    DropshipPassenger,
+    /// Manually aiming/firing an owned, unoccupied `Turret` building — see
+    /// `crate::turret_control::OccupiedTurretId` for which one. Only the
+    /// turret's own owner can ever enter it (see `shared::protocol::
+    /// TurretSnapshot::occupant_player_id`'s own docs on why this isn't a
+    /// shared passenger-style seat).
+    TurretOperator,
     #[default]
     OnFoot,
 }
@@ -507,6 +538,265 @@ fn handle_vehicle_key(
                 *mode = ControlMode::Passenger;
             }
         }
+        // Tank/dropship/turret boarding and exit are each their own
+        // separate system's concern — see `handle_tank_dropship_key`'s own
+        // docs for why.
+        ControlMode::Tank | ControlMode::DropshipPilot | ControlMode::DropshipPassenger | ControlMode::TurretOperator => {}
+    }
+}
+
+/// Tank/dropship counterpart to `handle_vehicle_key` — kept as a genuinely
+/// separate system rather than folded into that one match (which already
+/// sits at Bevy's 16-parameter `SystemParam` tuple limit) instead of, say,
+/// grouping several of its existing parameters into a custom
+/// `#[derive(SystemParam)]` struct to make room. That refactor was the more
+/// "textbook" fix, but `handle_vehicle_key` is explicitly documented as
+/// fragile — one deliberately single, carefully-ordered match existing
+/// specifically to prevent exit-then-immediately-re-enter in one frame —
+/// and reworking its parameter shape risked introducing a subtle regression
+/// into that already-tuned, working car/plane path for a purely additive
+/// feature. The tradeoff this separate system accepts instead: since it
+/// runs *after* `handle_vehicle_key` in the same chain, exiting a car/plane/
+/// passenger seat that happens to leave you within `ENTER_RADIUS` of an
+/// owned tank or a boardable dropship could auto-board that in the very
+/// same `F` press — narrow (it needs a tank/dropship parked within a few
+/// meters of wherever you got out), and never a car/plane/passenger
+/// regression, since `handle_vehicle_key` itself is untouched.
+#[allow(clippy::too_many_arguments)]
+fn handle_tank_dropship_key(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut mode: ResMut<ControlMode>,
+    mut driving_tank: ResMut<DrivingTankId>,
+    mut driving_dropship: ResMut<DrivingDropshipId>,
+    mut passenger_dropship: ResMut<PassengerDropshipId>,
+    mut commands: Commands,
+    tank_q: Query<(&Transform, &TankChassis), With<LocalTank>>,
+    dropship_q: Query<(&Transform, &DropshipSnapshot), With<LocalDropship>>,
+    foreign_dropship_q: Query<(&Transform, &DropshipSnapshot), Without<LocalDropship>>,
+    noise: Res<TerrainNoise>,
+    origin: Res<WorldOrigin>,
+    rapier_context: ReadRapierContext,
+    pilot_q: Query<(Entity, &Transform), With<Pilot>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if !keyboard.just_pressed(KeyCode::KeyF) {
+        return;
+    }
+
+    match *mode {
+        ControlMode::Tank => {
+            let Some((tank_tf, chassis)) = tank_q.iter().find(|(_, chassis)| Some(chassis.tank_id) == driving_tank.0)
+            else {
+                return;
+            };
+            // Same "server keeps re-applying the last input forever, so
+            // send one final hard-braked message" reasoning
+            // `handle_vehicle_key`'s `Car` arm gives — a tank has no
+            // separate `ExitTankMsg` (it's grounded, not a hoverplane; see
+            // `shared::tank_physics`'s own docs), so this final
+            // `TankInputMsg` is the whole story, same as a car.
+            commands.client_trigger(TankInputMsg {
+                tank_id: chassis.tank_id,
+                throttle: 0.0,
+                steer: 0.0,
+                brake: true,
+                turret_yaw: 0.0,
+            });
+            let exit_local = tank_tf.translation + *tank_tf.right() * 3.5;
+            let ground_y = surface_y_below(&rapier_context, &noise, exit_local, origin.to_true(exit_local));
+            spawn_pilot(&mut commands, &mut meshes, &mut materials, ground_y, exit_local);
+            driving_tank.0 = None;
+            *mode = ControlMode::OnFoot;
+        }
+        ControlMode::DropshipPilot => {
+            let Some((dropship_tf, snapshot)) =
+                dropship_q.iter().find(|(_, snapshot)| Some(snapshot.dropship_id) == driving_dropship.0)
+            else {
+                return;
+            };
+            let surface_y = surface_y_below(
+                &rapier_context,
+                &noise,
+                dropship_tf.translation,
+                origin.to_true(dropship_tf.translation),
+            );
+            commands.client_trigger(DropshipInputMsg {
+                dropship_id: snapshot.dropship_id,
+                throttle: 0.0,
+                yaw: 0.0,
+                pitch: 0.0,
+                roll: 0.0,
+            });
+            // Same "cut engines, hard stop" reasoning `ExitPlaneMsg` needs
+            // beyond a zeroed input message alone — see that message's own
+            // docs.
+            commands.client_trigger(ExitDropshipMsg { dropship_id: snapshot.dropship_id });
+            let exit_local = dropship_tf.translation + *dropship_tf.right() * 4.0;
+            // Same "always allowed, at any altitude — fall rather than
+            // teleport to ground" shape `handle_vehicle_key`'s `Plane` arm
+            // uses.
+            let spawn_y = dropship_tf.translation.y.max(surface_y);
+            spawn_pilot(&mut commands, &mut meshes, &mut materials, spawn_y, exit_local);
+            driving_dropship.0 = None;
+            *mode = ControlMode::OnFoot;
+        }
+        ControlMode::DropshipPassenger => {
+            let Some(dropship_id) = passenger_dropship.0 else { return };
+            let Some((dropship_tf, _)) =
+                foreign_dropship_q.iter().find(|(_, snapshot)| snapshot.dropship_id == dropship_id)
+            else {
+                return;
+            };
+            commands.client_trigger(ExitDropshipPassengerMsg { dropship_id });
+            let exit_local = dropship_tf.translation + *dropship_tf.right() * 4.0;
+            let ground_y = surface_y_below(&rapier_context, &noise, exit_local, origin.to_true(exit_local));
+            spawn_pilot(&mut commands, &mut meshes, &mut materials, ground_y, exit_local);
+            passenger_dropship.0 = None;
+            *mode = ControlMode::OnFoot;
+        }
+        ControlMode::OnFoot => {
+            let Ok((pilot_entity, pilot_tf)) = pilot_q.single() else { return };
+            let nearest_tank = tank_q
+                .iter()
+                .filter(|(tank_tf, _)| tank_tf.translation.distance(pilot_tf.translation) < ENTER_RADIUS)
+                .min_by(|(a_tf, _), (b_tf, _)| {
+                    a_tf.translation
+                        .distance(pilot_tf.translation)
+                        .total_cmp(&b_tf.translation.distance(pilot_tf.translation))
+                });
+            let nearest_own_dropship = dropship_q
+                .iter()
+                .filter(|(dropship_tf, _)| dropship_tf.translation.distance(pilot_tf.translation) < ENTER_RADIUS)
+                .min_by(|(a_tf, _), (b_tf, _)| {
+                    a_tf.translation
+                        .distance(pilot_tf.translation)
+                        .total_cmp(&b_tf.translation.distance(pilot_tf.translation))
+                });
+            // Only offered once neither of your own tank/dropship is in
+            // reach — same "walking up to your own always boards you as
+            // the operator" priority `handle_vehicle_key`'s passenger-seat
+            // check gives a car.
+            let nearest_passenger_seat = foreign_dropship_q
+                .iter()
+                .filter(|(dropship_tf, snapshot)| {
+                    snapshot.passenger_player_ids.contains(&None)
+                        && dropship_tf.translation.distance(pilot_tf.translation) < ENTER_RADIUS
+                })
+                .min_by(|(a_tf, _), (b_tf, _)| {
+                    a_tf.translation
+                        .distance(pilot_tf.translation)
+                        .total_cmp(&b_tf.translation.distance(pilot_tf.translation))
+                });
+            if let Some((_, chassis)) = nearest_tank {
+                driving_tank.0 = Some(chassis.tank_id);
+                commands.entity(pilot_entity).despawn();
+                *mode = ControlMode::Tank;
+            } else if let Some((_, snapshot)) = nearest_own_dropship {
+                driving_dropship.0 = Some(snapshot.dropship_id);
+                commands.entity(pilot_entity).despawn();
+                *mode = ControlMode::DropshipPilot;
+            } else if let Some((_, snapshot)) = nearest_passenger_seat {
+                commands.client_trigger(BoardDropshipMsg { dropship_id: snapshot.dropship_id });
+                passenger_dropship.0 = Some(snapshot.dropship_id);
+                commands.entity(pilot_entity).despawn();
+                *mode = ControlMode::DropshipPassenger;
+            }
+        }
+        // Car/Plane/Passenger are entirely `handle_vehicle_key`'s concern;
+        // turret boarding is `handle_turret_key`'s.
+        ControlMode::Car | ControlMode::Plane | ControlMode::Passenger | ControlMode::TurretOperator => {}
+    }
+}
+
+/// Turret counterpart to `handle_vehicle_key`/`handle_tank_dropship_key` —
+/// same reasoning for being its own system (`handle_vehicle_key`'s own
+/// docs on the 16-parameter `SystemParam` limit), chained immediately
+/// after `handle_tank_dropship_key` so the same "only acts if a prior
+/// system in this chain didn't already consume this `F` press" ordering
+/// holds — see that function's own docs on the one narrow edge case this
+/// ordering accepts.
+#[allow(clippy::too_many_arguments)]
+fn handle_turret_key(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut mode: ResMut<ControlMode>,
+    mut occupied_turret: ResMut<crate::turret_control::OccupiedTurretId>,
+    mut occupied_turret_local: ResMut<crate::turret_control::OccupiedTurretLocal>,
+    local_player_id: Res<crate::auth_ui::LocalPlayerId>,
+    mut commands: Commands,
+    turrets_q: Query<(&BuildingSnapshot, &TurretSnapshot)>,
+    pilot_q: Query<(Entity, &Transform), With<Pilot>>,
+    origin: Res<WorldOrigin>,
+    noise: Res<TerrainNoise>,
+    rapier_context: ReadRapierContext,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if !keyboard.just_pressed(KeyCode::KeyF) {
+        return;
+    }
+
+    match *mode {
+        ControlMode::TurretOperator => {
+            let Some(building_id) = occupied_turret.0 else { return };
+            let Some((building, _)) = turrets_q.iter().find(|(b, _)| b.id == building_id) else {
+                return;
+            };
+            commands.client_trigger(shared::protocol::ExitTurretMsg { building_id });
+            // `building.ground_y`, not a placeholder `0.0` — the turret's
+            // own settled surface height, same field its visual mesh uses
+            // (`building_render.rs`'s `building_transform`). A bare `0.0`
+            // here only happened to work near true (0,0,0); anywhere the
+            // terrain sits well above or below that, `exit_local`'s
+            // raycast origin below would start from entirely the wrong
+            // altitude.
+            let local =
+                (DVec3::new(building.true_x, building.ground_y as f64, building.true_z) - origin.offset).as_vec3();
+            let exit_local = local + Vec3::new(2.5, 0.0, 0.0);
+            let ground_y = surface_y_below(&rapier_context, &noise, exit_local, origin.to_true(exit_local));
+            spawn_pilot(&mut commands, &mut meshes, &mut materials, ground_y, exit_local);
+            occupied_turret.0 = None;
+            *mode = ControlMode::OnFoot;
+        }
+        ControlMode::OnFoot => {
+            let Ok((pilot_entity, pilot_tf)) = pilot_q.single() else { return };
+            let Some(player_id) = local_player_id.0 else { return };
+            let nearest_turret = turrets_q
+                .iter()
+                .filter(|(b, snapshot)| {
+                    b.kind == shared::buildings::BuildingKind::Turret
+                        && b.owner_player_id == player_id
+                        && snapshot.occupant_player_id.is_none()
+                })
+                .map(|(b, _)| {
+                    // `b.ground_y`, not a placeholder `0.0` — the turret's
+                    // own settled surface height, same field its visual
+                    // mesh uses (`building_render.rs`'s
+                    // `building_transform`). A flat `0.0` here was the
+                    // actual root cause of a real reported bug ("turrets
+                    // aren't enterable"): on any terrain that isn't near
+                    // true (0,0,0)'s own height, this placed the detection
+                    // point far above or below the turret's real,
+                    // visually-correct position — the distance check below
+                    // then failed even while standing right next to it,
+                    // since it was really measuring distance to a point
+                    // floating underground or in midair.
+                    let local = (DVec3::new(b.true_x, b.ground_y as f64, b.true_z) - origin.offset).as_vec3();
+                    (b.id, local)
+                })
+                .filter(|(_, local)| local.distance(pilot_tf.translation) < ENTER_RADIUS)
+                .min_by(|(_, a), (_, b)| {
+                    a.distance(pilot_tf.translation).total_cmp(&b.distance(pilot_tf.translation))
+                });
+            if let Some((building_id, local)) = nearest_turret {
+                commands.client_trigger(shared::protocol::EnterTurretMsg { building_id });
+                occupied_turret.0 = Some(building_id);
+                occupied_turret_local.0 = local;
+                commands.entity(pilot_entity).despawn();
+                *mode = ControlMode::TurretOperator;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -677,7 +967,14 @@ fn manage_cursor_confinement(
         || menu_open.0
         || chat_open.0
         || settings_open.0
-        || *mode == ControlMode::Car;
+        || *mode == ControlMode::Car
+        // A tank's (or a manually-operated turret's) own turret aims at
+        // wherever the real cursor is pointing on screen (`tank.rs`'s own
+        // raycast, the same technique `building_placement.rs` uses) — same
+        // "needs a real, free cursor position, not the locked/hidden
+        // mouse-look crosshair" reasoning `Car` gets this for.
+        || *mode == ControlMode::Tank
+        || *mode == ControlMode::TurretOperator;
     if want_free {
         cursor.grab_mode = CursorGrabMode::None;
         cursor.visible = true;
@@ -696,7 +993,7 @@ fn manage_cursor_confinement(
 /// crosshair drawn at screen center (`hud.rs`'s `Crosshair`) *is* where
 /// the player is visually aiming once their own cursor is gone.
 pub fn aim_position(mode: ControlMode, menu_open: bool, window: &Window) -> Option<Vec2> {
-    if mode == ControlMode::Car || menu_open {
+    if mode == ControlMode::Car || mode == ControlMode::Tank || mode == ControlMode::TurretOperator || menu_open {
         window.cursor_position()
     } else {
         Some(Vec2::new(window.width() / 2.0, window.height() / 2.0))
@@ -896,15 +1193,35 @@ fn update_pilot_camera(
 /// updated by their own plugins earlier in `Update`/`FixedUpdate`, so by
 /// the time this runs every source is already this frame's real value,
 /// not last frame's.
+#[allow(clippy::too_many_arguments)]
 fn sync_player_focus(
     mode: Res<ControlMode>,
     driving_car: Res<DrivingCarId>,
     driving_plane: Res<DrivingPlaneId>,
     passenger_car: Res<PassengerCarId>,
+    driving_tank: Res<DrivingTankId>,
+    driving_dropship: Res<DrivingDropshipId>,
+    passenger_dropship: Res<PassengerDropshipId>,
     mut focus: ResMut<PlayerFocus>,
     car_q: Query<(&Transform, &CarChassis, &CarSnapshot), With<LocalCar>>,
     plane_q: Query<(&Transform, &PlaneSnapshot), With<LocalPlane>>,
     foreign_car_q: Query<(&Transform, &CarChassis, &CarSnapshot), Without<LocalCar>>,
+    tank_q: Query<(&Transform, &TankChassis, &TankSnapshot), With<LocalTank>>,
+    // No `With<LocalDropship>` filter — unlike the tank/car queries above,
+    // this same query has to answer both "which dropship am I piloting"
+    // (always your own) *and* "which dropship am I riding in as a
+    // passenger" (never your own, see `PassengerDropshipId`'s own docs),
+    // so ownership can't be baked into the query itself the way it can for
+    // the other two.
+    dropship_q: Query<(&Transform, &DropshipSnapshot)>,
+    // Just the turret's own cached local position (set once, on entry —
+    // see `handle_turret_key`), not a fresh `BuildingSnapshot` query +
+    // `WorldOrigin` conversion every frame — a turret never moves, so
+    // there's nothing to re-derive, and this function is already at
+    // Bevy's 16-parameter `SystemParam` tuple limit with no room to spare
+    // for two more params that would only ever recompute the same
+    // unchanging value.
+    occupied_turret_local: Res<crate::turret_control::OccupiedTurretLocal>,
     pilot_q: Query<(&Transform, &PilotMotion), With<Pilot>>,
 ) {
     match *mode {
@@ -958,6 +1275,42 @@ fn sync_player_focus(
                 focus.linear_velocity = snapshot.linear_velocity;
             }
         }
+        ControlMode::Tank => {
+            if let Some((transform, _, snapshot)) =
+                tank_q.iter().find(|(_, chassis, _)| Some(chassis.tank_id) == driving_tank.0)
+            {
+                focus.translation = transform.translation;
+                focus.forward = *transform.forward();
+                focus.linear_velocity = snapshot.linear_velocity;
+            }
+        }
+        ControlMode::DropshipPilot => {
+            if let Some((transform, snapshot)) =
+                dropship_q.iter().find(|(_, snapshot)| Some(snapshot.dropship_id) == driving_dropship.0)
+            {
+                focus.translation = transform.translation;
+                focus.forward = *transform.forward();
+                focus.linear_velocity = snapshot.linear_velocity;
+            }
+        }
+        ControlMode::DropshipPassenger => {
+            if let Some((transform, snapshot)) =
+                dropship_q.iter().find(|(_, snapshot)| Some(snapshot.dropship_id) == passenger_dropship.0)
+            {
+                focus.translation = transform.translation;
+                focus.forward = *transform.forward();
+                focus.linear_velocity = snapshot.linear_velocity;
+            }
+        }
+        // Stationary — velocity is always zero, position is whatever was
+        // cached on entry (see `handle_turret_key`). Forward stays at
+        // whatever it already was (this focus doesn't drive any camera,
+        // only the HUD/`PlayerPositionMsg`, neither of which needs a
+        // meaningful facing here).
+        ControlMode::TurretOperator => {
+            focus.translation = occupied_turret_local.0;
+            focus.linear_velocity = Vec3::ZERO;
+        }
         ControlMode::OnFoot => {
             if let Ok((transform, motion)) = pilot_q.single() {
                 focus.translation = transform.translation;
@@ -991,4 +1344,122 @@ fn send_player_position(
         rotation_y,
         on_foot: *mode == ControlMode::OnFoot,
     });
+}
+
+#[cfg(test)]
+mod turret_key_tests {
+    use super::*;
+    use crate::auth_ui::LocalPlayerId;
+    use crate::turret_control::{OccupiedTurretId, OccupiedTurretLocal};
+    use bevy::app::App;
+    use shared::buildings::BuildingKind;
+    use shared::terrain_gen::TerrainNoise;
+
+    /// Reproduces the reported "F doesn't let me into the turret" bug in
+    /// isolation — spawns exactly the entities the real game would have
+    /// (an owned, unoccupied, completed `Turret` building near the
+    /// on-foot `Pilot`) and runs `handle_turret_key` directly, with no
+    /// client/networking/rendering involved at all.
+    #[test]
+    fn f_near_an_owned_unoccupied_turret_enters_it() {
+        let mut app = App::new();
+        app.add_plugins((bevy::state::app::StatesPlugin, bevy_replicon::prelude::RepliconPlugins));
+        shared::protocol::register_protocol(&mut app);
+        app.init_resource::<Time>();
+        app.init_resource::<ButtonInput<KeyCode>>();
+        app.insert_resource(ControlMode::OnFoot);
+        app.init_resource::<OccupiedTurretId>();
+        app.init_resource::<OccupiedTurretLocal>();
+        app.init_resource::<WorldOrigin>();
+        app.init_resource::<TerrainNoise>();
+        app.init_resource::<Assets<Mesh>>();
+        app.init_resource::<Assets<StandardMaterial>>();
+
+        let player_id = Uuid::new_v4();
+        app.insert_resource(LocalPlayerId(Some(player_id)));
+
+        app.world_mut().spawn((Pilot, PilotMotion::default(), Transform::from_xyz(0.0, 0.0, 0.0)));
+        app.world_mut().spawn((
+            BuildingSnapshot {
+                id: Uuid::new_v4(),
+                kind: BuildingKind::Turret,
+                owner_player_id: player_id,
+                true_x: 3.0,
+                true_z: 0.0,
+                build_complete_at: 0.0,
+                rotation_y: 0.0,
+                ground_y: 0.0,
+            },
+            TurretSnapshot::default(),
+        ));
+
+        app.add_systems(Update, handle_turret_key);
+        app.world_mut().resource_mut::<ButtonInput<KeyCode>>().press(KeyCode::KeyF);
+        app.update();
+
+        // `ControlMode` doesn't derive `Debug` (see its own definition),
+        // so a plain boolean assertion rather than `assert_eq!`.
+        assert!(
+            *app.world().resource::<ControlMode>() == ControlMode::TurretOperator,
+            "F should have entered the turret"
+        );
+        assert!(app.world().resource::<OccupiedTurretId>().0.is_some());
+    }
+
+    /// Regression test for the actual reported bug: a turret sitting on
+    /// elevated terrain (`ground_y` far from `0.0`) must still be
+    /// enterable from right next to it. Before the fix, the entry check
+    /// computed the turret's detection point at a hardcoded `y = 0.0`
+    /// instead of `ground_y`, so on any terrain not near true (0,0,0)'s
+    /// own height, that point floated far above or below the turret's
+    /// real, visually-correct position — reported live as "the detection
+    /// point is floating underground or above ground while the turret
+    /// itself is snapped onto the ground."
+    #[test]
+    fn f_near_a_turret_on_elevated_terrain_still_enters_it() {
+        let mut app = App::new();
+        app.add_plugins((bevy::state::app::StatesPlugin, bevy_replicon::prelude::RepliconPlugins));
+        shared::protocol::register_protocol(&mut app);
+        app.init_resource::<Time>();
+        app.init_resource::<ButtonInput<KeyCode>>();
+        app.insert_resource(ControlMode::OnFoot);
+        app.init_resource::<OccupiedTurretId>();
+        app.init_resource::<OccupiedTurretLocal>();
+        app.init_resource::<WorldOrigin>();
+        app.init_resource::<TerrainNoise>();
+        app.init_resource::<Assets<Mesh>>();
+        app.init_resource::<Assets<StandardMaterial>>();
+
+        let player_id = Uuid::new_v4();
+        app.insert_resource(LocalPlayerId(Some(player_id)));
+
+        // A hill, not flat ground near zero — the pilot stands at the same
+        // elevated height the turret actually settled at, exactly like a
+        // player standing next to it on a real hillside.
+        const HILL_HEIGHT: f32 = 47.0;
+        app.world_mut().spawn((Pilot, PilotMotion::default(), Transform::from_xyz(0.0, HILL_HEIGHT, 0.0)));
+        app.world_mut().spawn((
+            BuildingSnapshot {
+                id: Uuid::new_v4(),
+                kind: BuildingKind::Turret,
+                owner_player_id: player_id,
+                true_x: 3.0,
+                true_z: 0.0,
+                build_complete_at: 0.0,
+                rotation_y: 0.0,
+                ground_y: HILL_HEIGHT,
+            },
+            TurretSnapshot::default(),
+        ));
+
+        app.add_systems(Update, handle_turret_key);
+        app.world_mut().resource_mut::<ButtonInput<KeyCode>>().press(KeyCode::KeyF);
+        app.update();
+
+        assert!(
+            *app.world().resource::<ControlMode>() == ControlMode::TurretOperator,
+            "F should have entered the turret even though it's on elevated terrain"
+        );
+        assert!(app.world().resource::<OccupiedTurretId>().0.is_some());
+    }
 }

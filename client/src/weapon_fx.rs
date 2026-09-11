@@ -6,6 +6,7 @@ use bevy_replicon::prelude::ClientTriggerExt;
 use shared::combat::FIRE_COOLDOWN_SECS;
 use shared::protocol::{FireGunMsg, GunFiredMsg};
 
+use crate::building_placement::PlacementState;
 use crate::fx::{FadeLight, FadeOut, GrowScale, Lifetime};
 use crate::worldspace::WorldOrigin;
 
@@ -91,15 +92,45 @@ struct LocalFireCooldown {
     remaining: f32,
 }
 
+/// Left mouse button, not `F` — `F` is also vehicle enter/exit
+/// (`pilot::handle_vehicle_key`/`handle_tank_dropship_key`), and a tank's
+/// own turret already claims the free cursor for aiming (see
+/// `tank::read_tank_input`'s own docs) the same way a real game pairs
+/// "aim with the mouse" with "fire with the mouse." Held `F` firing while
+/// *also* meaning "get out" was a real, reported regression the moment a
+/// vehicle's exit and its fire trigger could both react to the same
+/// keypress — switching the trigger entirely away from `F` removes the
+/// conflict for every vehicle at once rather than needing each one to
+/// individually special-case it.
+///
+/// Gated on `!menu_open.0`, not just `!chat_open.0` — the build bar/
+/// selected-building panel (`building_ui.rs`) is a real clickable UI
+/// surface while `MenuOpen` (`E`) is on, and firing a gun out from behind
+/// it on every menu click would be exactly the kind of thing this project's
+/// existing `Sense::CLICK`-only-widgets work already went out of its way
+/// to avoid for keyboard focus. Also gated on `PlacementState::is_idle`
+/// (the same check `selection.rs`'s own click-to-select and
+/// `building_placement.rs`'s own placement clicks already use) — without
+/// it, a left-click meant to fire while a building placement is actively
+/// being dragged (choosing where/which way it goes) would *also* land as
+/// that placement's own confirming click, spending real resources on
+/// whatever was mid-placement.
 fn send_fire_input(
     time: Res<Time>,
-    keyboard: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
     chat_open: Res<crate::chat::ChatOpen>,
+    menu_open: Res<crate::pilot::MenuOpen>,
+    placement_state: Res<PlacementState>,
     mut cooldown: ResMut<LocalFireCooldown>,
     mut commands: Commands,
 ) {
     cooldown.remaining = (cooldown.remaining - time.delta_secs()).max(0.0);
-    if chat_open.0 || !keyboard.pressed(KeyCode::KeyF) || cooldown.remaining > 0.0 {
+    if chat_open.0
+        || menu_open.0
+        || !placement_state.is_idle()
+        || !mouse.pressed(MouseButton::Left)
+        || cooldown.remaining > 0.0
+    {
         return;
     }
     cooldown.remaining = FIRE_COOLDOWN_SECS;
@@ -133,17 +164,29 @@ fn spawn_gun_fired_fx(
     mut materials: ResMut<Assets<StandardMaterial>>,
     origin: Res<WorldOrigin>,
     smoke: Res<SmokeEffect>,
+    mut sfx: MessageWriter<crate::audio::PlaySfx>,
 ) {
+    // Every client's reaction to any shot, local or remote, gets the same
+    // sound — see this module's own top-level docs on `GunFiredMsg` being
+    // a broadcast.
+    sfx.write(crate::audio::gunshot_sfx());
+
     let muzzle_true = DVec3::new(fired.muzzle_true_x, fired.muzzle_y as f64, fired.muzzle_true_z);
     let end_true = DVec3::new(fired.end_true_x, fired.end_y as f64, fired.end_true_z);
     let muzzle_local = (muzzle_true - origin.offset).as_vec3();
     let end_local = (end_true - origin.offset).as_vec3();
 
-    commands.spawn((
-        Transform::from_translation(muzzle_local),
-        ParticleEffect::new(smoke.0.clone()),
-        Lifetime::new(SMOKE_EMITTER_LIFETIME),
-    ));
+    // Same `TERRAIN_CAR_NO_PARTICLES` toggle `thrusters.rs` uses — skips
+    // spawning this shot's smoke-puff hanabi instance entirely, for A/B
+    // testing a reported CPU cost against every other particle effect in
+    // the game at once.
+    if std::env::var("TERRAIN_CAR_NO_PARTICLES").is_err() {
+        commands.spawn((
+            Transform::from_translation(muzzle_local),
+            ParticleEffect::new(smoke.0.clone()),
+            Lifetime::new(SMOKE_EMITTER_LIFETIME),
+        ));
+    }
 
     commands.spawn((
         Mesh3d(meshes.add(Sphere::new(1.0))),

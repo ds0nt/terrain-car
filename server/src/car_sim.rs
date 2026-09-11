@@ -9,7 +9,7 @@ use shared::car_physics::{
     compute_wheel_forces, default_chassis, wheel_mounts, CarChassis, CarInput, CarInputState,
     WheelStepInput, CAR_ANGULAR_DAMPING, CAR_LINEAR_DAMPING, CAR_MASS,
 };
-use shared::combat::{Health, DEFAULT_MAX_HEALTH};
+use shared::combat::{Combatant, Health, DEFAULT_MAX_HEALTH};
 use shared::protocol::{
     BoardPassengerMsg, BuildingSnapshot, CarCosmetics, CarInputMsg, CarResetMsg, CarSnapshot,
     ExitPassengerMsg, FlipUprightMsg, PlayerOnFootSnapshot, PlayerPositionMsg, RecallPlayerMsg, RecallToHangarMsg,
@@ -419,6 +419,7 @@ pub(crate) fn spawn_car_for(
             CarSnapshot { home_true_x: true_x, home_true_z: true_z, ..Default::default() },
             (
                 Health::full(DEFAULT_MAX_HEALTH),
+                Combatant { owner_player_id },
                 LastFired::default(),
                 Replicated,
                 // Starts at defaults (automatic owner-hash color, no bow) —
@@ -574,11 +575,14 @@ fn apply_recall_player(
 /// session-scoped prediction target, and stay parked right where they were,
 /// full parity with how a `Scout Plane` already survives its pilot logging
 /// off.
+#[allow(clippy::too_many_arguments)]
 fn despawn_player_on_disconnect(
     remove: On<Remove, ConnectedClient>,
     mut commands: Commands,
     accounts: Query<(Entity, &OwnedBy)>,
     mut cars: Query<&mut CarSnapshot>,
+    mut dropships: Query<&mut shared::protocol::DropshipSnapshot>,
+    mut turrets: Query<&mut shared::protocol::TurretSnapshot>,
     mut registry: ResMut<PlayerRegistry>,
     mut op_list: ResMut<OpList>,
     mut identities: ResMut<PlayerIdentities>,
@@ -597,14 +601,28 @@ fn despawn_player_on_disconnect(
         if let Some((true_x, true_z)) = positions.get(player_id) {
             persistence.send(PersistenceCommand::SavePosition(PositionRow { player_id, true_x, true_z }));
         }
-        // A passenger who disconnects mid-ride never sends
-        // `ExitPassengerMsg` — without this, their seat would stay
-        // permanently occupied (from every other client's point of view,
-        // and blocking anyone else from boarding) until the server
-        // restarts.
+        // A passenger/occupant who disconnects mid-ride never sends their
+        // own exit message — without clearing these here, a seat or a
+        // turret would stay permanently occupied (from every other
+        // client's point of view, and blocking anyone else from taking it
+        // over) until the server restarts. Same fix, three call sites:
+        // a car's single passenger seat, a dropship's four independent
+        // ones, and a turret's sole manual-control occupant.
         for mut snapshot in &mut cars {
             if snapshot.passenger_player_id == Some(player_id) {
                 snapshot.passenger_player_id = None;
+            }
+        }
+        for mut snapshot in &mut dropships {
+            for slot in &mut snapshot.passenger_player_ids {
+                if *slot == Some(player_id) {
+                    *slot = None;
+                }
+            }
+        }
+        for mut snapshot in &mut turrets {
+            if snapshot.occupant_player_id == Some(player_id) {
+                snapshot.occupant_player_id = None;
             }
         }
     }

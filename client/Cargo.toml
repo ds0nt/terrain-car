@@ -7,6 +7,15 @@ edition.workspace = true
 name = "terrain_car"
 path = "src/main.rs"
 
+[features]
+# `cargo run --release --features profiling` writes a Chrome/Perfetto-format
+# trace-<timestamp>.json (per-system span timings) to the working directory
+# on exit — open it at ui.perfetto.dev, or hand the file to Claude to read
+# directly, to see exactly which system is eating frame time. No extra
+# profiler GUI install needed on either end (unlike `trace_tracy`, which
+# needs the separate Tracy application running to capture anything).
+profiling = ["bevy/trace_chrome"]
+
 [dependencies]
 shared = { path = "../shared" }
 bevy = { version = "0.19.1", features = ["jpeg"] }
@@ -19,3 +28,14 @@ bevy_replicon_renet = "0.20.0"
 bevy_hanabi = { version = "0.19.0", default-features = false, features = ["3d"] }
 bevy_egui = "0.42.0"
 uuid = { version = "1.26.0", features = ["v4", "serde"] }
+# Pinned to the exact version `bevy_audio` itself uses (transitively, via
+# `bevy`'s default features) — see `audio.rs`'s own module docs on why this
+# game drives `rodio` directly rather than through Bevy's own `AudioPlayer`/
+# `PlaybackSettings` components: `bevy_audio`'s device-opening code
+# (`AudioOutput`) is a private, `pub(crate)` type with no way to select
+# anything but the OS default output device, so device selection needs its
+# own independent `rodio` output stream. Matching the version exactly avoids
+# pulling two incompatible copies of the crate into one binary.
+# `experimental` gates `rodio::speakers` (device enumeration/selection) —
+# see `audio.rs`'s own docs on why this game needs that module directly.
+rodio = { version = "0.22.2", features = ["experimental"] }

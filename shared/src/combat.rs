@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Every car spawns with (and respawns to) this much health.
 pub const DEFAULT_MAX_HEALTH: f32 = 100.0;
@@ -45,6 +46,23 @@ impl Health {
     pub fn refill(&mut self) {
         self.current = self.max;
     }
+}
+
+/// Generic "who owns this shootable thing" marker, present on every vehicle
+/// that carries a `Health` (car, tank, plane, dropship) alongside its own
+/// kind-specific chassis/snapshot component. Exists purely so a targeting
+/// system that doesn't care *what kind* of vehicle it's looking at (chiefly
+/// `server::turrets`' auto-aim, which has to compare against every vehicle
+/// kind at once) can query one uniform component instead of separately
+/// handling `CarChassis`, `TankChassis`, `PlaneSnapshot`, and
+/// `DropshipSnapshot` each with their own `owner_player_id` field. Not
+/// replicated (no `Serialize`/`Deserialize`) — this is a server-only
+/// query aid, never anything a client needs to know about; each vehicle's
+/// own chassis/snapshot component already replicates its owner id for
+/// every client-side purpose.
+#[derive(Component, Clone, Copy)]
+pub struct Combatant {
+    pub owner_player_id: Uuid,
 }
 
 #[cfg(test)]

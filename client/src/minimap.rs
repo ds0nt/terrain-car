@@ -1,3 +1,4 @@
+use bevy::math::DVec3;
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
 use shared::car_physics::CarChassis;
@@ -95,6 +96,14 @@ fn relief_color(relief: f32) -> egui::Color32 {
     }
 }
 
+/// Cached raw ground heights for the relief wash's `RELIEF_GRID x RELIEF_GRID`
+/// sample points, plus the world position they were sampled at — see
+/// `draw_minimap`'s own docs on why this exists at all.
+struct ReliefHeightCache {
+    sampled_at: DVec3,
+    ground_y: [[f32; RELIEF_GRID as usize]; RELIEF_GRID as usize],
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_minimap(
     mut contexts: EguiContexts,
@@ -106,6 +115,7 @@ fn draw_minimap(
     remote_players_q: Query<(&PlayerOnFootSnapshot, &PlayerInfo), Without<LocalPlayerAccount>>,
     buildings_q: Query<&BuildingSnapshot>,
     villagers_q: Query<&VillagerSnapshot>,
+    mut relief_cache: Local<Option<ReliefHeightCache>>,
 ) -> Result {
     // Centered on `PlayerFocus`, not a hardcoded `LocalCar` query — see
     // that resource's own docs. This radar used to stay pinned on the
@@ -113,6 +123,38 @@ fn draw_minimap(
     // (flying, walking); now it follows whatever you actually occupy.
     let local_true = origin.to_true(focus.translation);
     let forward = focus.forward;
+
+    let cell_m = (RADAR_METERS * 2.0) / RELIEF_GRID as f32;
+
+    // `height_at` (see `shared::terrain_gen`) is dozens of layered noise
+    // samples deep per call — cheap once, not cheap 81 times a frame,
+    // forever, for a coarse background wash whose whole point is that it
+    // doesn't need per-pixel precision. Re-sampling the grid was previously
+    // unconditional every single frame regardless of whether the player had
+    // moved at all, a real fixed CPU cost with nothing to do with world
+    // size. Recomputing only once the player has moved roughly half a
+    // cell's width keeps the wash visually indistinguishable (each cell
+    // already spans `cell_m` meters) while cutting the actual noise-sampling
+    // cost to near zero while stationary or moving slowly.
+    let needs_resample = match relief_cache.as_ref() {
+        Some(cache) => local_true.distance(cache.sampled_at) > cell_m as f64 * 0.5,
+        None => true,
+    };
+    if needs_resample {
+        let mut ground_y = [[0.0f32; RELIEF_GRID as usize]; RELIEF_GRID as usize];
+        for row in 0..RELIEF_GRID {
+            for col in 0..RELIEF_GRID {
+                let dx = (col as f32 - (RELIEF_GRID - 1) as f32 / 2.0) * cell_m;
+                let dz = (row as f32 - (RELIEF_GRID - 1) as f32 / 2.0) * cell_m;
+                let world_x = local_true.x + dx as f64;
+                let world_z = local_true.z + dz as f64;
+                ground_y[row as usize][col as usize] = height_at(&noise, world_x, world_z);
+            }
+        }
+        *relief_cache = Some(ReliefHeightCache { sampled_at: local_true, ground_y });
+    }
+    // Safe to unwrap: the branch above just populated it if it was `None`.
+    let ground_y = &relief_cache.as_ref().unwrap().ground_y;
 
     egui::Area::new(egui::Id::new("minimap"))
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
@@ -123,18 +165,20 @@ fn draw_minimap(
 
             painter.circle_filled(center, RADAR_RADIUS_PX, egui::Color32::from_black_alpha(200));
 
-            // Relief wash.
+            // Relief wash — colors recomputed fresh every frame from the
+            // (possibly-cached) heights above, since that part is cheap:
+            // only the actual noise sampling is worth avoiding, and doing
+            // the relief-vs-`focus.translation.y` comparison live keeps the
+            // wash responding instantly to the player's own altitude
+            // changes even on a frame the height grid itself wasn't
+            // resampled.
             let cell_px = RADAR_PX / RELIEF_GRID as f32;
-            let cell_m = (RADAR_METERS * 2.0) / RELIEF_GRID as f32;
             for row in 0..RELIEF_GRID {
                 for col in 0..RELIEF_GRID {
                     let dx = (col as f32 - (RELIEF_GRID - 1) as f32 / 2.0) * cell_m;
                     let dz = (row as f32 - (RELIEF_GRID - 1) as f32 / 2.0) * cell_m;
                     let Some(cell_center) = world_to_screen(center, dx, dz) else { continue };
-                    let world_x = local_true.x + dx as f64;
-                    let world_z = local_true.z + dz as f64;
-                    let ground_y = height_at(&noise, world_x, world_z);
-                    let relief = ground_y - focus.translation.y;
+                    let relief = ground_y[row as usize][col as usize] - focus.translation.y;
                     let rect = egui::Rect::from_center_size(cell_center, egui::vec2(cell_px, cell_px));
                     painter.rect_filled(rect, 0.0, relief_color(relief));
                 }

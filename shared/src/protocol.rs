@@ -6,6 +6,7 @@ use uuid::Uuid;
 use crate::buildings::BuildingKind;
 use crate::car_physics::CarChassis;
 use crate::combat::Health;
+use crate::tank_physics::TankChassis;
 
 /// Client-only marker: tags whichever replicated car entity belongs to the
 /// local player, once its `CarChassis::owner_player_id` can be compared
@@ -692,6 +693,250 @@ pub struct TeleportMsg {
     pub true_z: f64,
 }
 
+/// Replicated snapshot of a tank's authoritative physical state — same
+/// "plain data, no Rapier types, purely server-authoritative, no client
+/// prediction" shape `CarSnapshot` uses and for the identical reason (an
+/// owner can have more than one). `turret_yaw` lives here, not on
+/// `TankChassis`, because it changes continuously (every tick the driver is
+/// aiming) while `TankChassis` is `replicate_once` — the same "changes over
+/// time -> Snapshot, fixed at spawn -> Chassis" split `CarSnapshot`/
+/// `CarChassis` already follow.
+#[derive(Component, Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct TankSnapshot {
+    pub translation: Vec3,
+    pub rotation: Quat,
+    pub linear_velocity: Vec3,
+    pub angular_velocity: Vec3,
+    /// World-space yaw (radians) the turret is currently facing —
+    /// independent of the hull's own heading. See
+    /// `shared::tank_physics::TankInput::turret_yaw`'s docs on how this
+    /// gets set.
+    pub turret_yaw: f32,
+    /// True-space position this tank recalls to on `RecallTankMsg` (`H`) —
+    /// the `WarFactory` that spawned it, same shape as `CarSnapshot::
+    /// home_true_x`/`home_true_z`.
+    pub home_true_x: f64,
+    pub home_true_z: f64,
+}
+
+/// Sent client -> server every `FixedUpdate` tick while the sender is
+/// driving their own tank — same "each message fully supersedes the last,
+/// nothing here ever reconciles/replays" shape `CarInputMsg` uses.
+/// `tank_id` names exactly which owned tank this drives, same reason
+/// `CarInputMsg::car_id` exists. `Unreliable`: a dropped one is harmless,
+/// the next tick's message fully supersedes it.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct TankInputMsg {
+    pub tank_id: Uuid,
+    pub throttle: f32,
+    pub steer: f32,
+    pub brake: bool,
+    /// Desired world-space turret yaw, mirrored straight onto
+    /// `TankSnapshot::turret_yaw` — see `shared::tank_physics::TankInput`'s
+    /// own docs.
+    pub turret_yaw: f32,
+}
+
+/// Sent client -> server when the driver presses R to right a flipped tank
+/// — same "correct orientation, drop back onto the ground at its own
+/// current position" shape `FlipUprightMsg` gives a car, just carrying
+/// `tank_id` explicitly rather than relying on an implicit "whichever
+/// vehicle this player is in" lookup, the same explicit-id lesson
+/// `CarInputMsg::car_id`'s own docs describe learning the hard way.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct TankFlipUprightMsg {
+    pub tank_id: Uuid,
+    pub true_x: f64,
+    pub true_z: f64,
+}
+
+/// Sent client -> server: teleport the sender's currently-driven tank back
+/// to whichever owned `WarFactory` is nearest right now — `H`, same shape
+/// as `RecallToHangarMsg`/`RecallPlaneMsg`.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct RecallTankMsg {
+    pub tank_id: Uuid,
+}
+
+/// Replicated snapshot of a dropship's authoritative physical state — flies
+/// exactly like a `PlaneSnapshot` (no client prediction, purely server-
+/// authoritative), but carries four independent passenger seats instead of
+/// a car's single `passenger_player_id`. The pilot seat isn't tracked here
+/// at all — piloting works exactly like a car/plane (client-local
+/// `ControlMode` + ownership check on `DropshipInputMsg`), so there's
+/// nothing server-side to record beyond `owner_player_id` itself.
+#[derive(Component, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct DropshipSnapshot {
+    pub owner_player_id: Uuid,
+    pub dropship_id: Uuid,
+    pub translation: Vec3,
+    pub rotation: Quat,
+    pub linear_velocity: Vec3,
+    pub home_true_x: f64,
+    pub home_true_z: f64,
+    /// Four passenger seats, independent of who (if anyone) is piloting —
+    /// `None` means empty. Set/cleared by `server::dropship_sim`'s
+    /// `apply_board_dropship`/`apply_exit_dropship_passenger`, never
+    /// recomputed from physics — same "pure seat-occupancy state" shape
+    /// `CarSnapshot::passenger_player_id` uses, just four of them. Not
+    /// restricted to the dropship's own owner: riding along is the whole
+    /// point, same as a car's passenger seat.
+    pub passenger_player_ids: [Option<Uuid>; 4],
+    /// Cargo currently slung underneath — up to `CARGO_SLOTS` (2) cars/
+    /// tanks at once. `None` means empty. Set/cleared by
+    /// `server::dropship_sim`'s `apply_pickup_vehicle`/`apply_drop_vehicle`,
+    /// same "pure occupancy state, not recomputed from physics" shape
+    /// `passenger_player_ids` already uses. Not restricted to the
+    /// dropship's own owner, and the carried vehicle needn't be owned by
+    /// anyone in particular either — a dropship can scoop up any car or
+    /// tank sitting on the ground nearby, same "no ownership check"
+    /// tolerance boarding a passenger seat already has.
+    pub cargo: [Option<CargoVehicleId>; CARGO_SLOTS],
+}
+
+/// How many vehicles a dropship can carry at once — a small, fixed cap
+/// rather than anything scaling with the craft, per the explicit "maximum
+/// 2? for now" scope this shipped with.
+pub const CARGO_SLOTS: usize = 2;
+
+/// Identifies one carried vehicle by kind + id — a dropship's cargo can be
+/// a mix of cars and tanks, and the two have separate id spaces
+/// (`CarChassis::car_id` vs `TankChassis::tank_id`), so a bare `Uuid`
+/// alone can't say which kind of entity to look up.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CargoVehicleId {
+    Car(Uuid),
+    Tank(Uuid),
+}
+
+/// Sent client -> server: `G` while piloting a dropship, near an eligible
+/// car/tank on the ground with a free cargo slot available — the sender
+/// picks which one (the nearest in range, same "client names the specific
+/// target" shape `EnterTurretMsg` uses), the server is the sole authority
+/// on whether it's actually close enough and a slot is actually free.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct PickupVehicleMsg {
+    pub dropship_id: Uuid,
+    pub target: CargoVehicleId,
+}
+
+/// Sent client -> server: `G` while piloting a dropship that's currently
+/// carrying something and has nothing new in range to pick up instead —
+/// releases the named cargo (always the most recently picked up one, from
+/// the client's own point of view — see `dropship::handle_pickup_key`).
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct DropVehicleMsg {
+    pub dropship_id: Uuid,
+    pub target: CargoVehicleId,
+}
+
+/// Sent client -> server every `FixedUpdate` tick while the sender is
+/// piloting their own dropship — identical shape to `PlaneInputMsg` (see
+/// its own field docs for throttle/yaw/pitch/roll), just for `dropship_id`
+/// instead of `plane_id`.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct DropshipInputMsg {
+    pub dropship_id: Uuid,
+    pub throttle: f32,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub roll: f32,
+}
+
+/// Sent client -> server when the pilot of `dropship_id` exits it — same
+/// "cut engines, let gravity take over" shape `ExitPlaneMsg` gives a plane
+/// (see that message's own docs); any passengers still aboard fall with it,
+/// same as they would if the pilot simply stopped flying it well.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct ExitDropshipMsg {
+    pub dropship_id: Uuid,
+}
+
+/// Sent client -> server when a player on foot boards a dropship as a
+/// passenger — same "no ownership check, any craft with an empty seat can
+/// be ridden" shape `BoardPassengerMsg` gives a car. The server assigns the
+/// sender to the first empty slot in `DropshipSnapshot::
+/// passenger_player_ids`; the client never picks a specific seat index.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct BoardDropshipMsg {
+    pub dropship_id: Uuid,
+}
+
+/// Sent client -> server when a current passenger of `dropship_id` gets
+/// out — the server clears whichever of the four slots currently holds the
+/// sender's own player id (no seat index needed client-side at all, unlike
+/// boarding there's exactly one slot that can possibly match).
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct ExitDropshipPassengerMsg {
+    pub dropship_id: Uuid,
+}
+
+/// Sent client -> server: teleport the sender's currently-piloted dropship
+/// back to whichever owned `Dropyard` is nearest right now — `H`, same
+/// shape as `RecallPlaneMsg`.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct RecallDropshipMsg {
+    pub dropship_id: Uuid,
+}
+
+/// Replicated aim state for a placed `BuildingKind::Turret` — kept as its
+/// own component (not folded into `BuildingSnapshot`) for the same reason
+/// `TankSnapshot::turret_yaw` isn't on `TankChassis`: `BuildingSnapshot` is
+/// effectively fixed after placement (only `build_complete_at` changes on
+/// its own timer), while a turret's aim rotates continuously as
+/// `server::turrets` tracks whatever it's currently targeting. Every
+/// client renders the same rotating head from this, not just whichever
+/// client happens to be nearby.
+#[derive(Component, Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct TurretSnapshot {
+    pub aim_yaw: f32,
+    /// Elevation, radians — `0.0` is level (aiming along the horizon),
+    /// positive tilts the barrel up. Clamped server-side to
+    /// `server::turrets::AIM_PITCH_RANGE`, a plausible mount elevation
+    /// range rather than a full sphere.
+    pub aim_pitch: f32,
+    /// Who's currently manually operating this turret, if anyone — `None`
+    /// means `server::turrets`'s own auto-aim/fire is in control (see that
+    /// module's own docs). Set/cleared by `apply_enter_turret`/
+    /// `apply_exit_turret`, same "pure seat-occupancy state" shape
+    /// `CarSnapshot::passenger_player_id` uses. Only the turret's own owner
+    /// can ever occupy it — unlike a car's passenger seat, this isn't
+    /// "anyone can ride along," it's "you can personally take over aiming
+    /// your own defense turret."
+    pub occupant_player_id: Option<Uuid>,
+}
+
+/// Sent client -> server: `F` while on foot near an owned, unoccupied
+/// `Turret` — takes manual control of its aim/fire away from
+/// `server::turrets`'s own auto-targeting. Rejected (silently, same
+/// tolerance every other boarding message here has for a stale/impossible
+/// request) if the sender doesn't own it or it's already occupied.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct EnterTurretMsg {
+    pub building_id: Uuid,
+}
+
+/// Sent client -> server: `F` while manually operating a turret — hands
+/// control back to `server::turrets`'s own auto-aim.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct ExitTurretMsg {
+    pub building_id: Uuid,
+}
+
+/// Sent client -> server every `FixedUpdate` tick while manually operating
+/// a turret — the operator's desired aim yaw, mirrored straight onto
+/// `TurretSnapshot::aim_yaw` with no server-side turn-rate limit (a human
+/// operator aiming with the mouse is exactly as instant as a tank driver's
+/// own `TankInputMsg::turret_yaw` — only the *unmanned* auto-aim slews at
+/// `server::turrets::TURRET_TURN_RATE`). `Unreliable`, same reasoning every
+/// other continuously-repeated input message here uses.
+#[derive(Event, Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct TurretAimMsg {
+    pub building_id: Uuid,
+    pub aim_yaw: f32,
+    pub aim_pitch: f32,
+}
+
 /// Registers everything that must be identical between client and server:
 /// which components replicate (and how often), and the client -> server /
 /// server -> client event channels. Both binaries call this exact function
@@ -744,6 +989,28 @@ pub fn register_protocol(app: &mut App) {
         .add_client_event::<ChatMsg>(Channel::Ordered)
         .add_server_event::<ChatBroadcastMsg>(Channel::Ordered)
         .add_server_event::<TeleportMsg>(Channel::Ordered)
+        // Tank — same replication/channel shape as its car equivalents,
+        // see each type's own docs.
+        .replicate_once::<TankChassis>()
+        .replicate::<TankSnapshot>()
+        .add_client_event::<TankInputMsg>(Channel::Unreliable)
+        .add_client_event::<TankFlipUprightMsg>(Channel::Ordered)
+        .add_client_event::<RecallTankMsg>(Channel::Ordered)
+        // Dropship — same replication/channel shape as its plane/car
+        // equivalents, see each type's own docs.
+        .replicate::<DropshipSnapshot>()
+        .add_client_event::<DropshipInputMsg>(Channel::Unreliable)
+        .add_client_event::<ExitDropshipMsg>(Channel::Ordered)
+        .add_client_event::<BoardDropshipMsg>(Channel::Ordered)
+        .add_client_event::<ExitDropshipPassengerMsg>(Channel::Ordered)
+        .add_client_event::<RecallDropshipMsg>(Channel::Ordered)
+        .add_client_event::<PickupVehicleMsg>(Channel::Ordered)
+        .add_client_event::<DropVehicleMsg>(Channel::Ordered)
+        // Turret defense building.
+        .replicate::<TurretSnapshot>()
+        .add_client_event::<EnterTurretMsg>(Channel::Ordered)
+        .add_client_event::<ExitTurretMsg>(Channel::Ordered)
+        .add_client_event::<TurretAimMsg>(Channel::Unreliable)
         .add_server_event::<WorldRegenMsg>(Channel::Ordered)
         // Unreliable: purely cosmetic, and another strike is at most 10s
         // away anyway, so a dropped one is never worth retransmitting.

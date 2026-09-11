@@ -55,6 +55,43 @@ pub struct CarChassis {
     pub car_id: Uuid,
 }
 
+/// The tuning fields `compute_wheel_forces` actually needs — implemented by
+/// both `CarChassis` and `shared::tank_physics::TankChassis` so the exact
+/// same suspension/drive/traction math in this module drives a tank's hull
+/// too, without duplicating it: a tank isn't physically different from a
+/// car at the wheel-contact level (see `shared::tank_physics`'s own module
+/// docs), it's just heavier, slower tuning plus an independently-aimed
+/// turret on top. `half_extents`/`rest_length`/`wheel_radius`/
+/// `max_steer_rad` aren't part of this trait — `compute_wheel_forces` never
+/// touches them (they're consumed upstream, by `wheel_mounts` and each
+/// sim's own raycast setup, which already just take/read plain fields
+/// directly rather than needing a shared abstraction).
+pub trait WheeledChassis {
+    fn spring_stiffness(&self) -> f32;
+    fn damper(&self) -> f32;
+    fn engine_force(&self) -> f32;
+    fn brake_force(&self) -> f32;
+    fn traction(&self) -> f32;
+}
+
+impl WheeledChassis for CarChassis {
+    fn spring_stiffness(&self) -> f32 {
+        self.spring_stiffness
+    }
+    fn damper(&self) -> f32 {
+        self.damper
+    }
+    fn engine_force(&self) -> f32 {
+        self.engine_force
+    }
+    fn brake_force(&self) -> f32 {
+        self.brake_force
+    }
+    fn traction(&self) -> f32 {
+        self.traction
+    }
+}
+
 #[derive(Component)]
 pub struct Wheel {
     pub local_offset: Vec3,
@@ -221,10 +258,12 @@ pub struct WheelStepOutput {
 
 /// Suspension spring/damper, drive force, laterally-clamped tire traction,
 /// and braking for one grounded wheel. See module docs on `WheelStepInput`
-/// for why this is a pure function rather than an ECS system.
-pub fn compute_wheel_forces(chassis: &CarChassis, input: &WheelStepInput) -> WheelStepOutput {
-    let spring_force = chassis.spring_stiffness * input.compression;
-    let damper_force = chassis.damper * input.closing_speed;
+/// for why this is a pure function rather than an ECS system. Generic over
+/// `WheeledChassis` (see that trait's own docs) so a `Tank`'s hull drives
+/// through this exact same math, not a hand-duplicated copy of it.
+pub fn compute_wheel_forces<C: WheeledChassis>(chassis: &C, input: &WheelStepInput) -> WheelStepOutput {
+    let spring_force = chassis.spring_stiffness() * input.compression;
+    let damper_force = chassis.damper() * input.closing_speed;
     let suspension_force = (spring_force - damper_force).max(0.0);
 
     // Everything below acts at the real ground contact point, arm and all —
@@ -237,7 +276,7 @@ pub fn compute_wheel_forces(chassis: &CarChassis, input: &WheelStepInput) -> Whe
     let forward_speed = input.point_velocity.dot(input.wheel_forward);
 
     if input.throttle.abs() > f32::EPSILON {
-        let drive_force = input.wheel_forward * (chassis.engine_force * 0.25 * input.throttle);
+        let drive_force = input.wheel_forward * (chassis.engine_force() * 0.25 * input.throttle);
         force += drive_force;
         torque += input.arm.cross(drive_force);
 
@@ -263,7 +302,7 @@ pub fn compute_wheel_forces(chassis: &CarChassis, input: &WheelStepInput) -> Whe
         // Deliberately much gentler than a real brake (~1/13th the
         // coefficient), so it reads as "coasting to a stop," not
         // "the brakes are always on a little."
-        let rolling_resistance = -input.wheel_forward * (forward_speed * chassis.brake_force * 0.00075);
+        let rolling_resistance = -input.wheel_forward * (forward_speed * chassis.brake_force() * 0.00075);
         force += rolling_resistance;
         torque += input.arm.cross(rolling_resistance);
     }
@@ -274,7 +313,7 @@ pub fn compute_wheel_forces(chassis: &CarChassis, input: &WheelStepInput) -> Whe
     // generate and overshoot every step — that was the actual source of an
     // earlier oscillating-roll flip bug, not the torque arm length.
     let lateral_speed = input.point_velocity.dot(input.wheel_right);
-    let desired_traction = -input.wheel_right * (lateral_speed * chassis.traction);
+    let desired_traction = -input.wheel_right * (lateral_speed * chassis.traction());
     let max_friction = suspension_force * TIRE_GRIP;
     let traction_force = if desired_traction.length() > max_friction {
         desired_traction.normalize() * max_friction
@@ -297,7 +336,7 @@ pub fn compute_wheel_forces(chassis: &CarChassis, input: &WheelStepInput) -> Whe
         // pitched the chassis into a dive, over-compressing the front
         // suspension (also unclamped) and launching it back up the very
         // next tick — the "car floats into the air on exit" bug.
-        let desired_brake_force = -input.wheel_forward * (forward_speed * chassis.brake_force * 0.01);
+        let desired_brake_force = -input.wheel_forward * (forward_speed * chassis.brake_force() * 0.01);
         let brake_force = if desired_brake_force.length() > max_friction {
             desired_brake_force.normalize() * max_friction
         } else {

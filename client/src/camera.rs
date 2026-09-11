@@ -81,8 +81,24 @@ pub enum CameraMode {
 #[derive(Component)]
 pub struct CarCamera;
 
-fn spawn_camera(mut commands: Commands) {
-    commands.spawn((
+// `pub(crate)` so `render_scale.rs` can order its own camera setup
+// `.after()` this — it needs `CarCamera` to already exist before it can
+// redirect that same entity's render target to an offscreen texture.
+pub(crate) fn spawn_camera(mut commands: Commands) {
+    // Same `TERRAIN_CAR_LOW_GRAPHICS` knob `lighting.rs::spawn_sun` already
+    // uses to drop shadow mapping — extended here to also skip the two
+    // priciest per-frame camera extras: `Bloom` (its own multi-pass
+    // downsample/upsample chain every frame) and
+    // `AtmosphereEnvironmentMapLight` (regenerates a reflection-probe
+    // environment map from the sky every frame). Both are purely cosmetic;
+    // dropping them is a quick, reversible way to A/B test how much of a
+    // reported CPU/GPU cost is coming from post-processing vs. everything
+    // else, on a weaker machine or just to check. `AtmosphereSettings`
+    // itself (the sky's own rendering) stays either way — only the
+    // reflection-probe generation on top of it is skipped.
+    let low_graphics = std::env::var("TERRAIN_CAR_LOW_GRAPHICS").is_ok();
+
+    let mut entity = commands.spawn((
         Camera3d::default(),
         // Default far plane (1000.0) would clip `stars.rs`'s starfield,
         // which sits well past any real terrain/gameplay draw distance on
@@ -98,11 +114,15 @@ fn spawn_camera(mut commands: Commands) {
         // exposure range.
         Exposure { ev100: 13.0 },
         Tonemapping::AcesFitted,
-        Bloom::NATURAL,
-        // Lets the sky's actual color/brightness drive ambient light and
-        // reflections instead of a flat fill light.
-        AtmosphereEnvironmentMapLight::default(),
     ));
+    if !low_graphics {
+        entity.insert((
+            Bloom::NATURAL,
+            // Lets the sky's actual color/brightness drive ambient light
+            // and reflections instead of a flat fill light.
+            AtmosphereEnvironmentMapLight::default(),
+        ));
+    }
 }
 
 /// `C`: toggles Chase/Cockpit — but *which* of the two independent camera

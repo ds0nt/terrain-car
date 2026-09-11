@@ -5,11 +5,14 @@ use shared::combat::Health;
 use shared::protocol::Wallet;
 use shared::terrain_gen::{biome_label, TerrainNoise};
 
+use shared::tank_physics::TankChassis;
+
 use crate::aircraft::PlaneInput;
 use crate::car::{CarChassis, DrivingCarId, LocalCar};
 use crate::pilot::{ControlMode, PlayerFocus};
 use crate::player_account::LocalPlayerAccount;
 use crate::recorder::RecordingActive;
+use crate::tank::{DrivingTankId, LocalTank};
 use crate::worldspace::WorldOrigin;
 
 pub struct HudPlugin;
@@ -60,7 +63,12 @@ fn update_crosshair_visibility(
     if !mode.is_changed() && !menu_open.is_changed() {
         return;
     }
-    let crosshair_visible = if *mode == ControlMode::Car || *mode == ControlMode::Passenger || menu_open.0 {
+    let crosshair_visible = if *mode == ControlMode::Car
+        || *mode == ControlMode::Passenger
+        || *mode == ControlMode::Tank
+        || *mode == ControlMode::TurretOperator
+        || menu_open.0
+    {
         Visibility::Hidden
     } else {
         Visibility::Visible
@@ -245,6 +253,7 @@ fn spawn_hud(mut commands: Commands) {
 /// showing "no car" for the health line must never also block the
 /// position/speed fields above from updating, which is exactly the bug an
 /// earlier single combined `car_q.single()` early-return would reintroduce.
+#[allow(clippy::too_many_arguments)]
 fn update_hud(
     time: Res<Time>,
     noise: Res<TerrainNoise>,
@@ -252,18 +261,28 @@ fn update_hud(
     focus: Res<PlayerFocus>,
     recording: Res<RecordingActive>,
     driving_car: Res<DrivingCarId>,
+    driving_tank: Res<DrivingTankId>,
     diagnostics: Res<DiagnosticsStore>,
     car_q: Query<(&Health, &CarChassis), With<LocalCar>>,
+    tank_q: Query<(&Health, &TankChassis), With<LocalTank>>,
     account_q: Query<&Wallet, With<LocalPlayerAccount>>,
     mut prev_vertical_speed: Local<f32>,
+    mut biome_cache: Local<Option<(bevy::math::DVec3, &'static str)>>,
     mut fields_q: Query<(&mut Text, &HudField)>,
 ) {
     // The car you're actually driving (`DrivingCarId`), not `.iter().next()`
     // (an arbitrary owned car) — a player can own several cars now (see
     // `car.rs`'s top-level docs), and showing some other parked car's
     // health instead of the one you're sitting in was exactly the reported
-    // "when I join a car it should be the correct car" bug.
-    let health = car_q.iter().find(|(_, chassis)| Some(chassis.car_id) == driving_car.0).map(|(h, _)| h);
+    // "when I join a car it should be the correct car" bug. Falls back to
+    // the driven tank's own health (same id-matched lookup) when there's no
+    // driven car — the two are mutually exclusive by `ControlMode`, so at
+    // most one of these ever actually finds something.
+    let health = car_q
+        .iter()
+        .find(|(_, chassis)| Some(chassis.car_id) == driving_car.0)
+        .map(|(h, _)| h)
+        .or_else(|| tank_q.iter().find(|(_, chassis)| Some(chassis.tank_id) == driving_tank.0).map(|(h, _)| h));
     let wallet = account_q.single().ok();
     // `smoothed()`, not the raw instantaneous value — a per-frame FPS
     // number jitters wildly frame to frame (one slightly slower frame
@@ -279,7 +298,21 @@ fn update_hud(
     let altitude = focus.translation.y;
 
     let true_pos = origin.to_true(focus.translation);
-    let world_type = biome_label(&noise, true_pos.x, true_pos.z);
+    // `biome_label` samples `climate_at`'s noise layers — cheap next to
+    // `height_at`'s (see `minimap.rs`'s own docs on that one), but still
+    // real, avoidable cost to pay every single frame for a label that only
+    // needs to change when you've crossed into meaningfully different
+    // terrain — the underlying noise wavelengths here span thousands of
+    // meters, so 50m of slack is imperceptible.
+    const BIOME_RESAMPLE_DISTANCE: f64 = 50.0;
+    let world_type = match *biome_cache {
+        Some((last_pos, label)) if true_pos.distance(last_pos) <= BIOME_RESAMPLE_DISTANCE => label,
+        _ => {
+            let label = biome_label(&noise, true_pos.x, true_pos.z);
+            *biome_cache = Some((true_pos, label));
+            label
+        }
+    };
 
     // A g-meter: net vertical acceleration including gravity, the same
     // quantity an accelerometer would read. Sits at 1.00 at rest (ground

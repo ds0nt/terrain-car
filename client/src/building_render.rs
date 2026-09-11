@@ -5,10 +5,15 @@ use bevy::prelude::*;
 use bevy_rapier3d::prelude::{Collider, Friction, RigidBody};
 use shared::buildings::{self, BuildingKind, ColliderShape};
 use shared::car_physics::CarChassis;
-use shared::protocol::{BuildingSnapshot, CarCosmetics};
+use shared::protocol::{BuildingSnapshot, CarCosmetics, TurretSnapshot};
+use shared::terrain_gen::CHUNK_SIZE;
 use shared::time::now_unix;
+use uuid::Uuid;
 
 use crate::owner_color::color_from_seed;
+use crate::pilot::PlayerFocus;
+use crate::terrain::ViewDistance;
+use crate::turret_render::spawn_turret_head_meshes;
 use crate::worldspace::WorldOrigin;
 
 /// Renders every replicated `BuildingSnapshot` — every player's, not just
@@ -17,18 +22,109 @@ use crate::worldspace::WorldOrigin;
 /// placeholder meshes per kind (no external texture/model assets, matching
 /// this project's existing cosmetic style), tinted translucent while under
 /// construction.
+///
+/// Visuals+physics are distance-streamed (`sync_building_visibility`), the
+/// same "only pay for what's actually near you" shape `terrain.rs`'s own
+/// chunk streaming already uses — unlike terrain, buildings used to get a
+/// real `Mesh3d`+`RigidBody::Fixed`+`Collider` the instant they replicated
+/// in, with no distance check at all, so a persistent world's *entire*
+/// accumulated building count (hundreds, across every player who's ever
+/// built anything) sat in every client's render/physics pipeline all the
+/// time regardless of where that client's own player actually was. That's
+/// real, permanent, ever-growing CPU cost (broad-phase collider upkeep,
+/// transform propagation, visibility-culling queries) for buildings nobody
+/// standing here could possibly see — exactly the "CPU-bound, GPU has
+/// headroom, gets worse the longer/bigger the world gets" shape a reported
+/// long-session lag turned out to match. `BuildingSnapshot` itself (and
+/// anything reading it directly, like the minimap) is unaffected either
+/// way — only the heavy client-only visual/physics components come and go.
 pub struct BuildingRenderPlugin;
 
 impl Plugin for BuildingRenderPlugin {
     fn build(&self, app: &mut App) {
-        app.add_observer(init_building_visuals)
-            .add_systems(Update, (sync_building_transform, update_construction_tint));
+        app.add_systems(
+            Update,
+            (sync_building_visibility, sync_building_transform, update_construction_tint, sync_turret_heads),
+        );
     }
+}
+
+/// Marks a building entity as currently carrying its heavy client-only
+/// visual/physics components (`Mesh3d`, `Collider`, ...) — `sync_building_visibility`'s
+/// own bookkeeping for which buildings are currently "loaded", the same
+/// role `terrain::LoadedChunks` plays for chunks.
+#[derive(Component)]
+struct BuildingVisualsLoaded;
+
+/// Buildings load in within `ViewDistance`'s own chunk radius (matching how
+/// far terrain itself is currently streamed in) and unload one chunk-width
+/// further out than that — the same load/unload hysteresis gap
+/// `terrain::ViewDistance::unload_radius` uses, so a building sitting right
+/// at the boundary doesn't flicker its collider/mesh in and out on every
+/// small movement.
+fn building_load_radius(view_distance: &ViewDistance) -> f32 {
+    view_distance.chunks as f32 * CHUNK_SIZE
+}
+
+fn building_unload_radius(view_distance: &ViewDistance) -> f32 {
+    building_load_radius(view_distance) + CHUNK_SIZE
+}
+
+/// Loads/unloads every building's heavy visual+physics components based on
+/// distance from the local player — see this module's own top-level docs
+/// for why. Runs every frame (like `terrain::stream_chunks`); cheap even
+/// with hundreds of buildings since the per-building work here is just a
+/// squared-distance comparison, nowhere near the cost it's saving.
+#[allow(clippy::too_many_arguments)]
+fn sync_building_visibility(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    origin: Res<WorldOrigin>,
+    focus: Res<PlayerFocus>,
+    view_distance: Res<ViewDistance>,
+    cars: Query<(&CarChassis, &CarCosmetics)>,
+    unloaded: Query<(Entity, &BuildingSnapshot), Without<BuildingVisualsLoaded>>,
+    loaded: Query<(Entity, &BuildingSnapshot), With<BuildingVisualsLoaded>>,
+) {
+    let local_true = origin.to_true(focus.translation);
+    let load_radius_sq = (building_load_radius(&view_distance) as f64).powi(2);
+    let unload_radius_sq = (building_unload_radius(&view_distance) as f64).powi(2);
+
+    for (entity, snapshot) in &unloaded {
+        let dx = snapshot.true_x - local_true.x;
+        let dz = snapshot.true_z - local_true.z;
+        if dx * dx + dz * dz <= load_radius_sq {
+            spawn_building_visuals(entity, &mut commands, &mut meshes, &mut materials, snapshot, &origin, &cars);
+        }
+    }
+
+    for (entity, snapshot) in &loaded {
+        let dx = snapshot.true_x - local_true.x;
+        let dz = snapshot.true_z - local_true.z;
+        if dx * dx + dz * dz > unload_radius_sq {
+            despawn_building_visuals(entity, &mut commands);
+        }
+    }
+}
+
+/// Removes every heavy client-only component `spawn_building_visuals`
+/// added — mesh, material, collider, and the transform that positions
+/// them, plus any child entities (side logos, a turret's own head) — while
+/// leaving the entity itself (and its replicated `BuildingSnapshot`) alone.
+/// `commands.entity(...).despawn_children()` recurses through the whole
+/// child subtree on its own, so a turret head's own further children come
+/// along for free.
+fn despawn_building_visuals(entity: Entity, commands: &mut Commands) {
+    commands
+        .entity(entity)
+        .despawn_children()
+        .remove::<(Mesh3d, MeshMaterial3d<StandardMaterial>, Transform, RigidBody, Collider, Friction, BuildingVisualsLoaded)>();
 }
 
 /// Mesh + base color + local-space transform for one building kind at a
 /// given placement — the actual per-kind geometry, shared by the real
-/// spawn (`init_building_visuals`) and the ghost preview
+/// spawn (`spawn_building_visuals`) and the ghost preview
 /// (`building_placement.rs`) so the ghost always looks/sits exactly like
 /// what will actually be placed. `ground_y` and `rotation_y` come from the
 /// caller (a live raycast for the ghost, the replicated snapshot for the
@@ -47,6 +143,9 @@ pub(crate) fn base_color_for_kind(kind: BuildingKind) -> Color {
         BuildingKind::ExtractionFacility => Color::srgb(0.75, 0.4, 0.2),
         BuildingKind::LandFactory => Color::srgb(0.3, 0.35, 0.32),
         BuildingKind::AirFactory => Color::srgb(0.35, 0.42, 0.5),
+        BuildingKind::WarFactory => Color::srgb(0.4, 0.32, 0.28),
+        BuildingKind::Dropyard => Color::srgb(0.4, 0.4, 0.3),
+        BuildingKind::Turret => Color::srgb(0.3, 0.3, 0.33),
     }
 }
 
@@ -87,7 +186,7 @@ pub(crate) fn building_mesh_and_transform(
     }
 
     // Cuboid/Cylinder dimensions and the collider used to actually block a
-    // car (see `init_building_visuals`) come from the exact same
+    // car (see `spawn_building_visuals`) come from the exact same
     // `collider_shape` per kind — mesh and collider can never drift apart.
     let mesh = match buildings::collider_shape(kind) {
         ColliderShape::Cuboid { half_x, half_y, half_z } => {
@@ -100,18 +199,66 @@ pub(crate) fn building_mesh_and_transform(
     (mesh, base_color, transform)
 }
 
-fn init_building_visuals(
-    insert: On<Insert, BuildingSnapshot>,
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    snapshots: Query<&BuildingSnapshot>,
-    origin: Res<WorldOrigin>,
-    cars: Query<(&CarChassis, &CarCosmetics)>,
+/// Tags a `Turret` building's rotating-head child entity — `building_entity`
+/// (not a hierarchy-relationship lookup) is how `sync_turret_heads` finds
+/// this head's own `TurretSnapshot` back on the building it belongs to,
+/// the same explicit "store the id you'll need later" shape
+/// `server::car_sim`'s `OwnedBy(Entity)` already uses.
+#[derive(Component)]
+struct BuildingTurretHead {
+    building_entity: Entity,
+    /// Same id as `BuildingSnapshot::id` — lets `sync_turret_heads` tell
+    /// whether this is the turret the *local* player currently occupies
+    /// (`turret_control::OccupiedTurretId` stores this same kind of id,
+    /// not an `Entity`) without an extra query.
+    building_id: Uuid,
+}
+
+/// Spins every `Turret`'s head to match its current aim — the replicated
+/// `TurretSnapshot` for every turret *except* the one the local player is
+/// currently manually operating, which instead reads
+/// `turret_control::LocalTurretAim` directly. See that module's own
+/// top-level docs on why: reading the replicated value even for your own
+/// turret made the head (and the camera, fixed the same way in
+/// `turret_control.rs`) visibly lag a network round-trip behind the
+/// operator's own already-instant mouse movement — the actual cause of a
+/// real reported "jitter while aiming" bug. Rotating this child entity
+/// directly (rather than the pivot offset) is correct with no extra offset
+/// math — see `turret_render`'s own docs.
+fn sync_turret_heads(
+    mut heads: Query<(&BuildingTurretHead, &mut Transform)>,
+    turrets: Query<&TurretSnapshot>,
+    occupied: Res<crate::turret_control::OccupiedTurretId>,
+    local_aim: Res<crate::turret_control::LocalTurretAim>,
 ) {
-    let Ok(snapshot) = snapshots.get(insert.entity) else {
-        return;
-    };
+    for (head, mut transform) in &mut heads {
+        let (yaw, pitch) = if occupied.0 == Some(head.building_id) {
+            (local_aim.yaw, local_aim.pitch)
+        } else if let Ok(snapshot) = turrets.get(head.building_entity) {
+            (snapshot.aim_yaw, snapshot.aim_pitch)
+        } else {
+            continue;
+        };
+        transform.rotation = shared::tank_physics::turret_aim_rotation(yaw, pitch);
+    }
+}
+
+/// Actually attaches a building's mesh/material/transform/collider (and, for
+/// non-slab kinds, its side-logo/turret-head children) to `entity` — called
+/// by `sync_building_visibility` the moment a building first comes within
+/// load range, whether that's because it just replicated in nearby or
+/// because the local player wandered back into range of one that had been
+/// unloaded.
+#[allow(clippy::too_many_arguments)]
+fn spawn_building_visuals(
+    entity: Entity,
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    snapshot: &BuildingSnapshot,
+    origin: &WorldOrigin,
+    cars: &Query<(&CarChassis, &CarCosmetics)>,
+) {
     // Uses the snapshot's own ground_y (the server's actual placement-time
     // surface raycast) rather than re-deriving via height_at — re-deriving
     // from raw terrain was exactly the bug that made a Ramp placed on top
@@ -120,7 +267,7 @@ fn init_building_visuals(
     let local = (DVec3::new(snapshot.true_x, 0.0, snapshot.true_z) - origin.offset).as_vec3();
     let (mesh, base_color, transform) = building_mesh_and_transform(
         snapshot.kind,
-        &mut meshes,
+        meshes,
         local.x,
         local.z,
         snapshot.ground_y,
@@ -151,7 +298,7 @@ fn init_building_visuals(
         })
         .unwrap_or(owner_color);
 
-    let mut entity = commands.entity(insert.entity);
+    let mut entity = commands.entity(entity);
     entity.insert((
         Mesh3d(mesh),
         MeshMaterial3d(materials.add(StandardMaterial {
@@ -160,6 +307,7 @@ fn init_building_visuals(
             ..default()
         })),
         transform,
+        BuildingVisualsLoaded,
     ));
 
     // Side logos — a kind-specific pictograph (bolt for `EnergyGenerator`,
@@ -171,7 +319,31 @@ fn init_building_visuals(
     if !snapshot.kind.uses_slab_geometry() {
         let shape = buildings::collider_shape(snapshot.kind);
         entity.with_children(|parent| {
-            spawn_kind_logos(parent, &mut meshes, &mut materials, snapshot.kind, shape, car_color);
+            spawn_kind_logos(parent, meshes, materials, snapshot.kind, shape, car_color);
+        });
+    }
+
+    // A `Turret`'s own rotating head — a separate child entity so
+    // `sync_turret_heads` can spin just this one, independent of the
+    // (non-rotating) base mesh set up above. `entity`'s id (not a
+    // relationship lookup) is what `BuildingTurretHead` records to find its
+    // own `TurretSnapshot` back later — see that component's own docs.
+    if snapshot.kind.is_turret() {
+        let ColliderShape::Cuboid { half_x, half_y, half_z } = buildings::collider_shape(snapshot.kind) else {
+            unreachable!("Turret's own collider_shape is always a Cuboid");
+        };
+        let half_extents = Vec3::new(half_x, half_y, half_z);
+        let building_entity = entity.id();
+        entity.with_children(|parent| {
+            parent
+                .spawn((
+                    Transform::default(),
+                    Visibility::default(),
+                    BuildingTurretHead { building_entity, building_id: snapshot.id },
+                ))
+                .with_children(|head| {
+                    spawn_turret_head_meshes(head, meshes, materials, half_extents, car_color);
+                });
         });
     }
 
@@ -203,7 +375,7 @@ fn init_building_visuals(
 /// `car_render.rs`'s `sync_car_transforms` and `villager_render.rs`'s
 /// `sync_villager_transform` already use, extended to buildings too.
 ///
-/// Before this, `init_building_visuals` computed `local` once, at insert
+/// Before this, `spawn_building_visuals` computed `local` once, at insert
 /// time, and nothing ever touched it again except `worldspace.rs`'s
 /// `rebase_world` — which only shifts on an ordinary in-play threshold
 /// crossing, not the much larger one-time jump `pilot.rs`'s
@@ -229,6 +401,22 @@ fn sync_building_transform(
     origin: Res<WorldOrigin>,
     mut buildings_q: Query<(&BuildingSnapshot, &mut Transform)>,
 ) {
+    // Buildings are static in true-space — the only reason this ever needs
+    // to touch a building's `Transform` at all is `WorldOrigin` itself
+    // moving (an ordinary rebase, or the larger login-time reset — see this
+    // function's own docs above). Skipping the loop entirely on every other
+    // frame isn't just an optimization: writing `*transform = ...`
+    // unconditionally, even to the same value, marks every loaded
+    // building's `Transform` "changed" via Bevy's own change-detection —
+    // which every downstream system that filters on `Changed<Transform>`
+    // (parent-transform propagation, visibility/AABB recompute, render-world
+    // extraction) then has to redo, for every currently-loaded building,
+    // every single frame, forever, regardless of whether anything actually
+    // moved. Gating on `is_changed()` here is what actually lets those
+    // systems' own change-detection do its job.
+    if !origin.is_changed() {
+        return;
+    }
     for (snapshot, mut transform) in &mut buildings_q {
         let local = (DVec3::new(snapshot.true_x, 0.0, snapshot.true_z) - origin.offset).as_vec3();
         *transform = building_transform(snapshot.kind, local.x, local.z, snapshot.ground_y, snapshot.rotation_y);
@@ -291,6 +479,19 @@ fn logo_parts_for_kind(kind: BuildingKind) -> Vec<LogoPart> {
             bar(0.3, 0.05, 0.0, 0.0, std::f32::consts::FRAC_PI_2),
             bar(0.3, 0.06, 0.0, 0.02, 0.0),
         ],
+        // A tank silhouette: hull bar plus a short raised barrel stub.
+        BuildingKind::WarFactory => vec![
+            bar(0.3, 0.12, 0.0, -0.08, 0.0),
+            bar(0.22, 0.05, 0.05, 0.1, 0.0),
+        ],
+        // A downward chevron — "drop."
+        BuildingKind::Dropyard => vec![
+            bar(0.22, 0.07, -0.12, 0.05, -0.8),
+            bar(0.22, 0.07, 0.12, 0.05, 0.8),
+        ],
+        // Turret's own head/barrel is a real rotating child entity (see
+        // `spawn_turret_head`), not a flat badge — nothing to badge here.
+        BuildingKind::Turret => Vec::new(),
     }
 }
 
@@ -298,7 +499,7 @@ fn logo_parts_for_kind(kind: BuildingKind) -> Vec<LogoPart> {
 /// `shape`'s real footprint — every side for a `Cuboid`, four points
 /// around the rim for a `Cylinder` — each rotated to sit flush against
 /// that face and tinted with `color` (the owner's actual car paint; see
-/// `init_building_visuals`).
+/// `spawn_building_visuals`).
 fn spawn_kind_logos(
     parent: &mut ChildSpawnerCommands,
     meshes: &mut Assets<Mesh>,
@@ -378,11 +579,32 @@ fn update_construction_tint(
 ) {
     let now = now_unix();
     for (snapshot, material) in &buildings {
+        let under_construction = snapshot.build_complete_at > now;
+        let target_alpha = if under_construction { 0.35 } else { 1.0 };
+        let target_mode = if under_construction { AlphaMode::Blend } else { AlphaMode::Opaque };
+
+        // Peek with a plain (non-dirtying) `get` first — the overwhelming
+        // majority of loaded buildings on any given frame are long since
+        // finished and already `Opaque`, so there's nothing left for this
+        // system to ever do for them again. `get_mut` (below) is real cost:
+        // it marks the asset "changed" via Bevy's change-detection even
+        // when written back to the exact same value, which forces
+        // `prepare_erased_assets<MeshMaterial3d<StandardMaterial>>` to
+        // re-extract and re-upload it to the render world on the very next
+        // frame — for every loaded building, every frame, forever, if
+        // nothing here gates it. Only actually reaching for `get_mut` on
+        // the (rare) frames a building's construction state genuinely
+        // changes is what lets that system's own change-detection skip
+        // everything already settled.
+        let Some(mat) = materials.get(&material.0) else { continue };
+        if mat.alpha_mode == target_mode && (mat.base_color.alpha() - target_alpha).abs() < f32::EPSILON {
+            continue;
+        }
+
         let Some(mut mat) = materials.get_mut(&material.0) else {
             continue;
         };
-        let under_construction = snapshot.build_complete_at > now;
-        mat.base_color.set_alpha(if under_construction { 0.35 } else { 1.0 });
-        mat.alpha_mode = if under_construction { AlphaMode::Blend } else { AlphaMode::Opaque };
+        mat.base_color.set_alpha(target_alpha);
+        mat.alpha_mode = target_mode;
     }
 }
